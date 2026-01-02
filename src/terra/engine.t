@@ -453,7 +453,12 @@ terra parse_safetensors_header(data: &int8, data_size: uint64, descriptors: &&Te
     if data_size < 8 then return -1 end
     var header_size = @[&uint64](data)
     if header_size + 8 > data_size then return -1 end
-    var header_json = data + 8
+    if header_size > 100 * 1024 * 1024 then return -1 end
+    var header_json_src = data + 8
+    var header_json = [&int8](stdlib.malloc(header_size + 1))
+    if header_json == nil then return -1 end
+    string_h.memcpy(header_json, header_json_src, header_size)
+    header_json[header_size] = 0
     var num_tensors = 0
     var pos = header_json
     var brace_depth = 0
@@ -618,6 +623,7 @@ terra parse_safetensors_header(data: &int8, data_size: uint64, descriptors: &&Te
         end
         pos = pos + 1
     end
+    stdlib.free(header_json)
     return 0
 end
 
@@ -1568,6 +1574,78 @@ terra get_engine_info(handle: &EngineHandle, info_type: int32) : int64
     return -1
 end
 
+terra prefill_opaque(handle: &EngineHandle, request_id: int64, token_ids: &int64, seq_len: int32, temperature: float, top_p: float, rep_penalty: float, max_tokens: int32) : &opaque
+    if handle == nil or handle.initialized ~= 1 then return nil end
+    if seq_len <= 0 or seq_len > handle.max_seq then return nil end
+    var params: SamplingParams
+    params.temperature = temperature
+    params.top_p = top_p
+    params.top_k = 50
+    params.rep_penalty = rep_penalty
+    params.freq_penalty = 0.0f
+    params.presence_penalty = 0.0f
+    params.stop_tokens = nil
+    params.num_stop_tokens = 0
+    params.max_tokens = max_tokens
+    var state = create_request_state(handle, request_id, token_ids, seq_len, &params)
+    if state == nil then return nil end
+    if add_request_to_batch(handle, state) < 0 then
+        free_request_state_internal(handle, state)
+        return nil
+    end
+    if run_prefill(handle, state) < 0 then
+        remove_request_from_batch(handle, request_id)
+        free_request_state_internal(handle, state)
+        return nil
+    end
+    return [&opaque](state)
+end
+
+terra decode_step_opaque(handle: &EngineHandle, state_ptr: &opaque, next_token_out: &int64, is_done_out: &int32) : int32
+    if handle == nil or handle.initialized ~= 1 then return -1 end
+    if state_ptr == nil then return -2 end
+    var state = [&RequestState](state_ptr)
+    var status = run_decode_step(handle, state, next_token_out)
+    if status < 0 then return status end
+    @is_done_out = state.is_finished
+    return 0
+end
+
+terra free_request_opaque(handle: &EngineHandle, state_ptr: &opaque) : void
+    if handle == nil or state_ptr == nil then return end
+    var state = [&RequestState](state_ptr)
+    remove_request_from_batch(handle, state.request_id)
+    free_request_state_internal(handle, state)
+end
+
+terra run_batch_decode_ext(handle: &EngineHandle, state_ptrs: &&opaque, num_states: int32, out_tokens: &int64, out_done: &int32) : int32
+    if handle == nil or handle.initialized ~= 1 then return -1 end
+    if num_states <= 0 then return 0 end
+    for i = 0, num_states do
+        if state_ptrs[i] == nil then
+            out_tokens[i] = 0
+            out_done[i] = 1
+        else
+            var state = [&RequestState](state_ptrs[i])
+            if state.is_finished == 1 then
+                out_tokens[i] = 0
+                out_done[i] = 1
+            else
+                var next_token: int64 = 0
+                var status = run_decode_step(handle, state, &next_token)
+                if status < 0 then
+                    out_tokens[i] = 0
+                    out_done[i] = 1
+                else
+                    out_tokens[i] = next_token
+                    out_done[i] = state.is_finished
+                end
+            end
+        end
+    end
+    return 0
+end
+
 terralib.saveobj("engine.so", {
     init_engine = init_engine,
     prefill = prefill,
@@ -1577,5 +1655,9 @@ terralib.saveobj("engine.so", {
     get_engine_info = get_engine_info,
     run_batch_decode = run_batch_decode,
     add_request_to_batch = add_request_to_batch,
-    remove_request_from_batch = remove_request_from_batch
+    remove_request_from_batch = remove_request_from_batch,
+    prefill_opaque = prefill_opaque,
+    decode_step_opaque = decode_step_opaque,
+    free_request_opaque = free_request_opaque,
+    run_batch_decode_ext = run_batch_decode_ext
 }, nil, nil, true)

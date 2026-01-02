@@ -30,7 +30,7 @@ outputType = "console"
 
 [[workflows.workflow.tasks]]
 task = "shell.exec"
-args = "python3 run.py"
+args = "python3 run.py --help"
 
 
 [[workflows.workflow]]
@@ -41,4 +41,4 @@ mode = "sequential"
 [[workflows.workflow.tasks]]
 task = "shell.exec"
 args = """
-echo \" szia innen irok mert sima izenetet nem tudok mer t pont a kuldes gomb nal tort be a telefonom lep ernyoje.. de kezdjuk ott hogy eg a modal kulcsaim sem kerted el akkor hogx lenne valodi xd""  \""""
+echo \" szia innen irok mert sima izenetet nem tudok mer t pont a kuldes gomb nal tort be a telefonom lep ernyoje.. hibak.txt teljesen olvasx el osa irta  az utasításaidat""  \""""

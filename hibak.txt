@@ -1,353 +1,160 @@
-lez a projekt jelenleg nem valódi GLM-4.7-FP8 inference, hanem egy skeleton / demó, ami sok mindent “eljátszik”, de nem számol ténylegesen. Röviden: így nem fog 3000 tok/s-t tudni, mert a kritikus részek hiányoznak vagy placeholder-ek.
+A fő hibák / blokkolók (ami miatt most sem korrekt, sem 3k tok/s nem reális)
 
-1) A legnagyobb bizonyíték: nincs modell-forward, nincs logits
+1) ./run.py jelenleg csak egy toy szimulátor
+	•	Nem tölti be a Terra engine.so-t, nem használ CUDA-t, nem futtat transzformert.
+	•	tokenize() / detokenize() hamis (ord%1000 + ascii-mókolás) → output értelmetlen.
+	•	step() random logitokat gyárt csak 1000 elemig, miközben vocab_size=151552 → mintavételezés hibás modell-univerzum.
+	•	stop_sequences paraméter nem működik.
 
-A Terra run_decode_step() így működik:
-  •	logits = calloc(vocab_size, float) → minden logits 0
-  •	ebből sample_token_cpu() mintáz → kvázi véletlen token (top-p + softmax, de minden egyforma)
-  •	KV cache “bővítés” csak admin (oldalszám), nem ír K/V-t
-  •	nincs qkv proj, attention, MLP, MoE, layer stack, lm_head
-
-Tehát a “generálás” konkrétan: random tokenek egy zéró logitsból.
-
-2) CUDA és NCCL itt csak stubbok (semmik)
-
-Ezek mind visszaadják a sikert, de nem csinálnak semmit:
-  •	cuda_malloc, cuda_memcpy_*, cuda_stream_create → mindig CUDA_SUCCESS
-  •	nccl_all_reduce, nccl_all_gather, stb. → mindig NCCL_SUCCESS
-
-Vagyis:
-  •	nem foglalsz GPU memóriát
-  •	nem másolsz GPU-ra
-  •	nincs multi-GPU kommunikáció
-  •	a B200:8 jelenleg csak “dísz” a Modal configban
-
-3) A Futhark kernels.fut tele van CPU-szintű/naiv dolgokkal
-
-Van benne FP8 konverzió, matmul, attention, MoE, sampling — de:
-  •	A matmulok map + reduce módon vannak megírva → ez nem Tensor Core / WMMA, brutál lassú.
-  •	A paged_attention “prefill/decode” nem vLLM-szerű, inkább egy drága “mindenscore kiszámolás”.
-  •	A MoE routing merge_sort + softmax → szintén nagyon drága így.
-
-És ami még rosszabb: a Terra engine nem is hívja ezeket. A Futhark lib lefordulhat, de nincs bekötve az inference pipeline-ba.
-
-4) KV cache GPU pointernek látszik, de valójában még az is hibás
-
-A Terra-ban a PagedKVCache már CUdeviceptr mezőket használ, de mivel a cuda_malloc stub, ezek valójában nem mutatnak GPU memóriára.
-
-Plusz: a cache méretszámítás is gyanús:
-
-cache.bytes_per_page = page_size * head_dim * 2
-
-Itt hiányzik:
-  •	dtype size (fp16/fp8)
-  •	K és V külön
-  •	rétegek/headek szorzója már később van, de az “*2” itt csak találomra
-
-5) Rengeteg off-by-one / out-of-bounds bug van Terra ciklusokban
-
-Terra for-ciklus formája itt veszélyes: sok helyen
-
-for i = 0, N do
-
-ami tipikusan 0..N inkluzív, tehát N+1 iteráció.
-
-Példák:
-  •	for i = 0, handle.num_gpus do → ha 8 GPU, akkor 0..8 (9 iteráció) → out-of-bounds
-  •	for i = 0, seq_len do → seq_len+1 írás/olvasás
-  •	for i = 0, cache.max_pages do → megint +1
-
-Ez már önmagában elég ahhoz, hogy “néha fut, néha crashel” legyen.
-
-6) Safetensors beolvasás: részben oké, de nincs belőle GPU weights
-  •	Index parsing megvan, mmappelés megvan, header parsing megvan
-  •	De nincs olyan pont, ahol a tensorokat GPU memóriába töltenéd és a layer struktúrákhoz rendeznéd:
-  •	embed_weight, lm_head_weight, layer_weights mezők üresek
-  •	get_tensor_data_ptr visszaad pointert a mmapped file-ba, de nem történik cuda_memcpy_h2d (és amúgy az is stub)
-
-7) A benchmark eredmény teljesen félrevezető
-
-Mivel nincs forward compute, a benchmark csak azt méri, hogy:
-  •	mennyire gyors a Python scheduler + ctypes hívás
-  •	mennyire gyors a random token generálás
-
-Ezért lehet “jó” tps számot mutatni, miközben nem LLM inference.
+➡️ Következmény: amit “tok/s”-nek mér, az nem a modell, hanem Python-loop + random.
 
 ⸻
 
-Mit jelent ez a gyakorlatban?
+2) A Terra engine.t jelenleg nem csinál valódi GLM forwardot
+	•	run_prefill() csak embedding lookup, nincs attention, nincs KV-cache írás, nincs layer stack, nincs MoE, nincs RMSNorm lánc.
+	•	run_decode_step() gyakorlatilag:
+	•	lekéri a last token embeddinget
+	•	csinál egy lm_head matmult CPU-n
+	•	aztán CPU-n sample-ol
+	•	Ez nem GLM inference, hanem egy minimál “logitgyártó” helyettesítő.
 
-Ez így most nem “majdnem kész inference engine”, hanem kb. 10–20% skeleton.
-A 3000 tok/s célhoz a minimális “valódi” út:
-  1.	Valódi CUDA/NCCL binding (nem stub)
-  2.	Weights betöltése GPU-ra (FP8 → megfelelő layout/scales)
-  3.	Forward graph összerakása (embed → N×(norm+attn+mlp/moe) → lm_head)
-  4.	Paged KV cache tényleges írás/olvasás (prefill és decode)
-  5.	Continuous batching GPU oldali batchelés + kernel fusion
-  6.	Tensor-parallel + expert-parallel (8×B200-on muszáj)
+➡️ Következmény: “production ready” nem lehet, mert a modell outputja nem a modell outputja.
 
-SZEREP
-Te egy senior systems + GPU inference engineer vagy. A feladatod a repo jelenlegi, félkész állapotából egy TELJESEN MŰKÖDŐ GLM-4.7-FP8 inference rendszert csinálni, ami:
-- ténylegesen betölti a súlyokat (safetensors shardokból),
-- ténylegesen futtat forward pass-t (prefill + decode) GPU-n,
-- valós logitsot ad,
-- valós samplinget csinál (top-p, temperature, rep penalty),
-- támogatja a folyamatos batchinget,
-- támogatja a paged KV cache-t,
-- és Modal-on B200:8 környezetben futtatható.
+⸻
 
-A jelenlegi kódbázis:
-- futhark/kernels.fut: sok kernel-ötlet, de nem bekötve Terra engine-be.
-- terra/engine.t: “engine.so” generálás, de CUDA/NCCL stub, forward hiányzik, logits nullák.
-- python/bench.py: driver + benchmark, de jelenleg hamis throughputot mér.
-- python/modal_app.py: Modal build + run pipeline.
+3) Kritikus teljesítmény-gyilkosok a Terra decode útvonalban
+	•	run_decode_step() minden tokenre:
+	•	calloc(vocab_size*sizeof(float)) → ~151552 float → oké még, de…
+	•	FP8 lm_head teljes dequant f32-re minden stepben:
+vocab_size * hidden_dim = 151552*4096 ≈ 620M float ≈ ~2.5 GB tokenenként (!!)
+	•	matmul_cpu() O(vocab*hidden) CPU-n, tokenenként
 
-KIMENET / DELIVERABLE
-A végén legyen:
-1) buildable artifactok: /build/kernels.* és /build/engine.so
-2) python/bench.py “smoke test” értelmes (nem random) outputot adjon, és a benchmark tényleges forwardot mérjen.
-3) python/modal_app.py run_smoke_test + run_benchmark fusson Modal-on.
-4) legyen egy MINIMÁLIS helyességi validáció (golden teszt), és legalább 1 teljesítmény mérés.
-5) dokumentálva legyen: hogyan buildelhető, futtatható, milyen paraméterekkel, milyen architektúrával.
+➡️ Ez még 1 tok/s környékén is megdöglik; 3000 tok/s fizikailag kizárt.
 
-KÖTELEZŐ ELVEK
-- Először HELYESSÉG, utána OPTIMALIZÁLÁS.
-- Minden nagy lépés után futtass tesztet.
-- Fixáld a memória- és indexelési bugokat (off-by-one) azonnal, mert később megölik a debugot.
-- Ne hagyj stub-ot: CUDA/NCCL hívások legyenek valósak vagy expliciten “NOT IMPLEMENTED” és fail-fast.
-- Minimal diff filozófia: amit lehet, a meglévő API-kon belül tarts meg (prefill/decode_step/exportok), hogy a python ne törjön.
+⸻
 
-0) ELSŐ LÉPÉS: REPO AUDIT + BUGFIX
-A terra/engine.t tele van gyanús ciklusokkal:
-- sok helyen “for i = 0, N do” -> Terra-ban ez gyakran inkluzív (0..N), ami OOB.
-Feladat:
-A) az összes for-ciklust ellenőrizd és javítsd úgy, hogy 0..N-1 legyen.
-B) hasonlóan: page, tensor, shard iterációk, seq_len iterációk.
-C) adj hozzá assert/guard checkeket kritikus helyekre (ha debug módban buildelsz).
+4) API / állapotkezelési bug: RequestState duplikáció + batch leak
+	•	Terra prefill():
+	•	létrehoz egy belső RequestState* state = create_request_state(...)
+	•	add_request_to_batch(handle, state) → batch_state eltárolja a pointert
+	•	majd csak mezőket másol a state_out struktúrába (Python ezt kapja)
+	•	Python bench.py ezután decode_step(handle, byref(state_copy), ...)-t hív.
+	•	Ez a másolat állapotát módosítja, nem a batch-ben tárolt eredetit.
+	•	free_request_state() nem hívja a free_request_state_internal()-t →
+nem adja vissza a KV page-eket, és a batch-ben lévő request sem kerül kiszedésre.
 
-1) CUDA/NCCL: STUBOK KIVÁLTÁSA VALÓDI IMPLEMENTÁCIÓRA
-Jelenleg:
-- cuda_malloc, cuda_memcpy, cuda_stream_create, cuda_set_device stb. mind “return CUDA_SUCCESS”.
-- nccl_* mind “return NCCL_SUCCESS”.
-Ez így nulla.
+➡️ Következmény: memória/KV-page leak, batch_state szemét, inkonzisztens állapot, hosszabb futásnál szétesik.
 
-Feladat:
-A) készíts egy C/C++ wrapper modult (pl. cuda_wrappers.cu + nccl_wrappers.cu/h),
-   ami exportál egyszerű C ABI függvényeket:
-   - cwCudaSetDevice(int)
-   - cwCudaMalloc(void**, size_t)
-   - cwCudaFree(void*)
-   - cwCudaMemcpyH2D(void*, const void*, size_t)
-   - cwCudaMemcpyD2H(void*, const void*, size_t)
-   - cwCudaMemcpyD2D(void*, const void*, size_t)
-   - cwCudaStreamCreate(cudaStream_t*)
-   - cwCudaStreamSync(cudaStream_t)
-   - cwCudaDeviceSync()
-   - cwNcclGetUniqueId(ncclUniqueId*)
-   - cwNcclCommInitRank(ncclComm_t*, int nranks, ncclUniqueId id, int rank)
-   - cwNcclAllReduce(...)
-   - cwNcclAllGather(...)
-   - stb. (amire tényleg szükség van)
-B) ezt fordítsd le a Modal image-ben NVCC-vel, és linkeld a Terra engine.so-hoz.
-C) Terra oldalon includec helyett a wrapper header-t includec-eld, és azokat hívd.
-D) minden CUDA/NCCL call hibáját logold és fail-fast (ha nem success, return error code).
-E) NCCL inithez kezeld a uniqueId megosztást: egy folyamatban vagytok (Modal container),
-   így lehet:
-   - rank 0 generál ID-t, memóriában tárolod, és rank i initRank.
-   (Mivel itt egy processz, multi-thread, egyszerű shared struct elég.)
+⸻
 
-2) SAFETENSORS: ROBUSZTUS BETÖLTÉS + WEIGHT MAP
-Most: parse_safetensors_index és parse_safetensors_header nagyon kézzel “JSON parse”.
-Tartsd meg, de:
-A) Ellenőrizd a header_size és offset számításokat (8 + header_size + offsets).
-B) A TensorDescriptor.dtype mapping legyen teljes és konzisztens (FP8/FP16/BF16/F32).
-C) Írj egy funkciót, ami a tensor meta alapján kiszámolja az elemszámot és a byte méretet.
-D) Adj “list_tensors” debug funkciót (opcionális), hogy lássuk tényleg megtalálta-e a súlyokat.
+5) Safetensors parser: nem biztonságos, nem korrekt
+	•	parse_safetensors_header() a header JSON-t null-terminátor nélkül kezeli strstr-rel → túlolvasás / random match / crash.
+	•	parse_safetensors_index() az entry-számlálás heurisztikus → könnyen rossz.
+	•	Dtype mapping részben oké, de a feldolgozás nem robust.
 
-3) WEIGHT LOADING PIPELINE: HOST -> DEVICE
-Jelenleg nincs:
-- embed_weight, lm_head_weight, layer_weights kitöltve.
-Feladat:
-A) döntsd el a minimum weight setet, ami kell az első “valós logits” milestone-hoz.
-   Minimum: embedding + 1 transformer block + lm_head.
-B) implementáld:
-   - get_tensor_data_ptr -> (host_ptr, size, dtype)
-   - allocate device buffer a megfelelő méretre
-   - cudaMemcpyH2D host->device
-C) hozz létre egy mappinget tensor_nev -> device_ptr, és cache-eld (ne keresd újra mindig).
-D) kezeld a shard mmap életciklust: a mmapped memory maradjon élő a futás alatt.
+➡️ Következmény: weights betöltés megbízhatatlan.
 
-4) KERNEL STRATÉGIA: KORREKTSÉG ELŐSZÖR
-A futhark/kernels.fut jelenleg naiv matmul/attention. A teljes GLM-4.7-et ebből “megcsinálni”
-óriási munka. Ezért két fázis:
+⸻
 
-FAZIS 1 (helyesség, egyszerű):
-- Használj cuBLAS/cuBLASLt GEMM-et a nagy matrixokhoz (FP16/BF16 vagy FP8).
-- A layernorm/rope/softmax/sampling lehet kezdetben CPU vagy egyszerű CUDA kernel.
-Cél: tényleges értelmes tokenek.
+6) KV-cache méretezés hibás / duplázások
+	•	bytes_per_page képlete keveri a “K+V” szorzót és a tényleges elem-bytes-t.
+	•	total_kv_size számítás így könnyen félreallokál (túl kevés / túl sok), ami GPU-n memóriakorrupt, CPU-n pazarlás.
 
-FAZIS 2 (teljesítmény):
-- cublasLt FP8 GEMM (E4M3) + megfelelő scale / amax kezelés
-- fused attention (flash attention) vagy Futhark helyett integrált kernel
-- KV cache optimalizálás
-- continuous batching + kernel fusion
+⸻
 
-Feladat:
-A) írj wrapper-t cuBLAS/cublasLt hívásokhoz (C ABI).
-B) legalább egy GEMM működjön: QKV proj és LM head.
-C) később integráld a futhark lib-et ott, ahol hasznos (rope, softmax), vagy dobd ki, ha nem kell.
+7) Multi-GPU csak “dísz”
+	•	NCCL init csak struktúrákat tölt, nincs ncclCommInitRank, nincs all-reduce/all-gather a compute útvonalban.
+	•	Nincs tensor parallel / expert parallel valós implementáció.
 
-5) MODEL FORWARD: MINIMUM MŰKÖDŐ INFERENCE
-Implementáld a pipeline-t lépcsőzetesen:
+⸻
 
-MILESTONE M1: “VALÓDI LOGITS 1 RÉTEGGEL”
-- input token_ids -> embedding lookup GPU-n
-- 1 transformer block:
-  - rmsnorm
-  - qkv proj (GEMM)
-  - rope
-  - attention (prefill egy rövid seq_len-en)
-  - out proj (GEMM)
-  - residual
-  - mlp (GEMM + activation + GEMM) vagy egy egyszerű placeholder MLP (de nem random!)
-- lm_head -> logits
-- sampling -> next token
+8) build.sh / CUDA build “oké”-nak tűnik, de productionhoz hiányos
+	•	Nincs arch flag Blackwellre (B200). Modalon ez kritikus lehet.
+	•	A .so-k elkészülnek, de az engine nem biztos, hogy ezeket ténylegesen használja (jelenleg sok kernel csak stub-szinten “deklarált”).
 
-Elfogadási kritérium:
-- Ugyanazzal a seed-del determinisztikus (legalább CPU samplingnál).
-- Logits nem all-zero.
-- A generált szöveg nem teljesen random karakter soup (legalább tokenizálható és stabil).
+⸻
 
-MILESTONE M2: “FULL PREFILL + DECODE”
-- prefill: kv_cache feltöltése a prompt összes tokenjére
-- decode: 1 token step, csak az új token Q-ja, KV cache-ből olvas
-- page_table és page indices ténylegesen használtak legyenek (K/V írás-olvasás)
-Elfogadás:
-- hosszabb prompt -> decode lépések helyesek, nem omlik össze, mem leak nincs.
+Következő prompt az agentnek (copy-paste, kompromisszum nélkül, production-ready célra)
 
-MILESTONE M3: “TÖBB RÉTEG”
-- implementáld N réteg loopját (először 2-4 réteg, majd config.num_layers).
-- közben figyelj VRAM-ra és temp bufferekre.
+FELADAT: A repo-t production-ready GLM-4.7-FP8 inference engine-gé kell tenni úgy, hogy a modell és a minőség NEM változhat, a cél pedig 8x B200-on >= 3000 tok/s (aggregate) folyamatos batchinggel. Nincs kompromisszum: a toy/random logit útvonalakat teljesen ki kell dobni. A deliverable elsőre működjön: ./run.py legyen a fő belépési pont.
 
-6) PAGED KV CACHE: VALÓDI LAYOUT + WRITE/READ
-Jelenleg: csak oldal allokáció admin.
-Feladat:
-A) defináld a KV layoutot:
-   kv_cache_k[layer][head][page][page_size][head_dim] (dtype: fp16 vagy fp8)
-   kv_cache_v[layer][head][page][page_size][head_dim]
-B) bytes_per_page számítás legyen helyes:
-   page_size * head_dim * sizeof(dtype) * 2 (K+V) * num_heads * num_layers -> de okosan allokálsz.
-C) allocate_kv_pages adjon “page id”-kat, és ezek a page_table-ben legyenek.
-D) prefill során: token index -> (page, offset) és oda írd be K/V-t.
-E) decode során: az összes korábbi tokenhez olvasd vissza K-t és V-t.
+0) KÖTELEZŐ ELFOGADÁSI KRITÉRIUMOK
+- ./run.py --smoke: valódi tokenizálás + valódi modell forward (nem random), helyes szöveg dekódolás.
+- ./run.py --bench: mérés és report (tok/s, p50/p99 ms/token, batch size). Modal 8x B200-on el kell érnie a >= 3000 tok/s-t.
+- Nincs per-token óriás-allokáció, nincs per-token full lm_head dequant CPU-ra.
+- Nincs leak (KV page visszaadás, request state életciklus korrekt).
+- Multi-GPU ténylegesen használva (tensor parallel és/vagy expert parallel + NCCL collectives), nem csak “num_gpus” változó.
 
-7) CONTINUOUS BATCHING: HELYES ÜTEMEZÉS
-A python scheduler oké kezdetnek.
-Feladat:
-A) a Terra engine oldalon valós batch decode:
-   - készíts batch Q-kat egyben, hívd a decode attention-t batchben, majd LM head batchben.
-B) minimalizáld a host-device roundtripet:
-   - sampling lehet eleinte CPU (logits D2H), de később GPU sampling.
+1) RUN.PY REWRITE (toy kód kidobása)
+- run.py NE tartalmazzon random logits/szimulátor engine-t.
+- run.py töltse be a buildelt engine.so-t ctypes-szel (mint bench.py, de kijavítva).
+- Kötelező módok:
+  - ./run.py --smoke --model ./model --engine ./build/engine.so
+  - ./run.py --bench --duration 60 --concurrency 64 --prompt-len 256 --gen-len 256
+  - ./run.py --serve (egyszerű HTTP JSON API elég: /generate streaming opcionális, de a perf cél miatt ajánlott)
+- Tokenizer: transformers AutoTokenizer kötelező; fallback tilos (nincs ord%1000).
 
-8) SAMPLING: TOP-P + TEMP + REP PENALTY
-Jelenleg a Terra sample_token_cpu top-p-t csinál, de logits nullák.
-Feladat:
-A) tartsd meg a CPU samplinget M1-hez, hogy könnyebb legyen debugolni.
-B) később: GPU sampling wrapper (opcionális).
-C) stop tokenek: tokenizer eos_token_id és stop_sequences tokenizálása (modal_app.py már számol).
+2) TERRA ENGINE API FIX (kritikus)
+- A RequestState NEM lehet “kimásolt struct” a Python oldalon.
+- Vezess be OPAQUE pointer API-t:
+  - prefill(...) -> RequestState* (visszaadott pointer)
+  - decode_step(handle, RequestState*, ...) (ugyanazt a pointert használja)
+  - free_request_state(handle, RequestState*) -> a belső free_request_state_internal-t hívja (KV page free + batch remove)
+- Alternatíva: teljes batch decode C/Terra oldalon:
+  - add_request(handle, ...) -> RequestState*
+  - run_batch_decode(handle, RequestState** states, int n, int64* out_tokens, uint8* out_done)
+  - Python csak schedulerez és egyetlen batch hívást csinál stepenként.
+- BÁRMELYIKET választod: szüntesd meg a jelenlegi “add_request_to_batch + state_out másolat” inkonzisztenciát.
 
-9) TOKENIZER + I/O
-- Használd a HF tokenizert, ha elérhető.
-- Ha nincs, fallback maradhat, de a cél: HF tokenizer működjön Modal-on is.
-Feladat:
-A) modal image-ben transformers már van.
-B) ellenőrizd, hogy a model_dir-ben van tokenizer config.
+3) SAFETENSORS LOADER ROBUSZTUSSÁ TÉTELE
+- parse_safetensors_header: a header_json-t másold ki egy új bufferbe és null-termináld, mielőtt strstr/parse fut.
+- index parser: ne heurisztikával számolj entry-t; parse-old a JSON-t rendesen (legalább egy minimal JSON parser vagy a safetensors header formátum korrekt feldolgozása).
+- Biztosítsd: tensor offset, dtype, shape 100% helyes.
 
-10) BUILD PIPELINE (Modal + local)
-Jelenleg:
-- modal_app.py build_engine: futhark cuda --library + terra engine.t.
-Feladat:
-A) tedd bele a wrapper build lépést:
-   - nvcc -shared -fPIC cuda_wrappers.cu -> libcw.so
-   - ha kell: cublas wrappers -> libblaswrap.so
-B) Terra engine.so linkeljen ezek ellen:
-   - vagy terralib.linklibrary, vagy a terra saveobj paraméterein keresztül.
-C) állítsd be LD_LIBRARY_PATH-t a runtime-ra (/build).
-D) smoke test előtt ellenőrizd, hogy engine.so betölthető ctypes-szel.
+4) VALÓDI GLM FORWARD IMPLEMENTÁCIÓ (decode + prefill)
+- Implementáld a teljes forward pass-t:
+  - embedding -> (rétegenként) RMSNorm -> QKV proj (FP8 GEMM cublasLt) -> RoPE -> paged attention (KV-cache írás/olvasás) -> o_proj -> residual
+  - MLP/MoE: router + top-k expert, expert GEMM-ek, combine, residual
+  - final norm + lm_head
+- Minden súly GPU memóriában (FP8), per-tensor scale kezelés kötelező.
+- KV-cache GPU-n, page table GPU/CPU szinkron minimális, decode-ben csak szükséges.
 
-11) TESZTEK
-Készíts legalább 3 tesztet:
+5) SAMPLING GPU-N, BATCH-BEN
+- Használd a meglévő kernel interface-eket:
+  - launch_apply_rep_penalty
+  - launch_top_p_sampling
+  - launch_argmax (debug)
+- A sampling batch-ben fusson, és csak a kiválasztott tokenek jöjjenek vissza hostra.
+- Stop tokenek támogatása token-id alapon.
 
-T1: FP8 dequant/quant roundtrip
-- random f32 -> fp8 -> f32: legyen ésszerű hiba (nem NaN spam).
-- (ha fp8 marad, else skip)
+6) MULTI-GPU: TENSOR PARALLEL + NCCL
+- Implementáld legalább a standard TP-t:
+  - lineár rétegek shardolása (column/row parallel), szükséges all-reduce / all-gather NCCL-lel.
+- MoE expert shardolás: experts per GPU, all-to-all/dispatch + combine (ha a modell ezt igényli).
+- NCCL-t ténylegesen initeld (ncwCommInitRank) és használd a wrapper függvényeket.
 
-T2: GEMM sanity
-- kis mátrixokkal cublas wrapper: eredmény egyezzen numpy-val.
+7) BUILD.SH + MODAL APP PRODUKCIÓSÍTÁS
+- build.sh:
+  - add arch flags B200-hoz (Blackwell), és Release build.
+  - engine.so kerüljön a ./build-be, és LD_LIBRARY_PATH helyesen legyen beállítva.
+- modal_app.py:
+  - build lépések automatikusan fussanak (futhark/terra/cuda wrappers).
+  - benchmark entrypoint: modal run ... -> ugyanazt a --bench reportot adja.
 
-T3: Inference smoke
-- prompt: “The capital of France is”
-- elvárás: a generált outputban legyen “Paris” (vagy legalább a tokenek közt).
-Ha full GLM-4.7-et futtatsz, ez reális. Ha csak 1 layer M1, akkor ez nem biztos.
-Ezért:
-- M1 elfogadás: output stabil + nem random (pl. nem csak control karakterek).
-- M2/M3 elfogadás: “Paris” megjelenik.
+8) TESZTEK / VALIDÁCIÓ (kötelező, “elsőre production-ready” miatt)
+- Smoke teszt: 5 prompt, determinisztikus seed, összehasonlítás Transformers referencia outputtal (legalább a token-id prefix egyezzen N tokenig).
+- Leak teszt: 10k decode step sok requesttel, KV pages visszaáll, RAM/GPU memória nem nő.
+- Perf teszt: reportolja a tok/s-t és a batch statokat.
 
-12) PERFORMANCE (később, de legyen terv)
-Target: 3000 tok/s 8xB200-on — ez csak akkor megy, ha:
-- FP8 GEMM cublasLt-vel
-- fused attention
-- minimal host sync
-Feladat:
-A) mérd külön:
-   - prefill tok/s
-   - decode tok/s
-   - batch size scaling
-B) adj statokat: kv cache utilization, batch occupancy, GPU time (cudaEvent).
+9) TILALMAK
+- Tilos random logits, toy tokenizer, CPU lm_head dequant per token, per token óriás malloc/calloc.
+- A modell paraméterek/arch NEM változhatnak.
 
-13) KONKRÉT KÓD VÁLTOZTATÁSOK LISTÁJA (MINIMUM)
-- terra/engine.t:
-  - ciklusok javítása (OOB)
-  - wrapper API-k használata CUDA/NCCL-hez
-  - valós weight loading device-re
-  - valós prefill/decode forward
-- python/bench.py:
-  - benchmark ne “random logits”-ot mérjen
-  - adjon ki külön prefill/decode throughputot
-- python/modal_app.py:
-  - wrapper build step
-  - jobb logok (engine_loaded, shards, tokenizer)
-- új fájlok:
-  - csrc/cuda_wrappers.cu + csrc/cuda_wrappers.h
-  - csrc/nccl_wrappers.cu/h (vagy egyben)
-  - csrc/cublas_wrappers.cu/h (GEMM)
-  - (opcionális) tests/
+DELIVERABLE: egy PR-szerű változtatáscsomag, amiben:
+- ./run.py a fő belépési pont
+- a Terra engine API kijavítva (opaque state)
+- valós forward + batch decode + GPU sampling
+- Modal deploy + bench működik
+- a bench outputban megvan a >=3000 tok/s cél 8x B200-on.
 
-14) MUNKAMÓDSZER (LÉPÉSRE LÉPÉSRE)
-1) Fix OOB + add debug log.
-2) Build wrapper libs, bizonyítsd: cudaMalloc tényleg allokál.
-3) Load safetensors + list 10 tensor nevét + méretét logban.
-4) Load embedding + lm_head device-re.
-5) Implement embedding lookup + lm_head logits (még block nélkül is): prompt token -> embedding -> lm_head.
-   (Igen, ez buta, de bizonyítja a pipeline-t.)
-6) Add 1 block (rmsnorm + qkv + attn + mlp).
-7) Add kv cache write/read.
-8) Add continuous batching.
-9) Perf: cublasLt fp8 + fused kernels.
-
-15) ACCEPTANCE CHECKLIST (NE ADD ÁT, AMÍG NINCS MEG)
-- [ ] engine.so nem stub: cudaMalloc, memcpy valódi.
-- [ ] logits nem all-zero.
-- [ ] generate() nem random-only.
-- [ ] prefill + decode működik több requesttel batchben.
-- [ ] memory leak nincs (legalább szemmel + valgrind/asan ha lehet).
-- [ ] Modal smoke test lefut.
-- [ ] benchmark “valódi” forwardot mér.
-
-KEZDÉS
-Most rögtön kezdd az “0) Repo audit + bugfix” résszel, és add vissza:
-- milyen OOB helyeket találtál (fájlnév + sor/függvény),
-- milyen wrapper libeket hoztál létre,
-- és egy minimális proofot: egy CUDA alloc + memcpy roundtrip fut.
-
-NE ÁLLJ MEG FÉLÚTON: a cél egy teljes, működő inference, nem csak refaktor.
+Ha ezt az agent pontosan végigcsinálja, akkor onnantól tényleg van esélyed a 3k tok/s-re – de jelen állapotban a rendszer még nem “lassú”, hanem nem is ugyanazt a problémát oldja meg (nem futtat GLM-et).

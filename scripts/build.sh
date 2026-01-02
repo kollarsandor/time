@@ -16,7 +16,22 @@ echo "Build dir: $BUILD_DIR"
 if command -v nvcc &> /dev/null; then
     echo "Building CUDA wrappers..."
     
-    CUDA_FLAGS="-shared -fPIC -O3 -Xcompiler -fPIC"
+    CUDA_ARCH=""
+    if nvcc --help | grep -q "compute_100"; then
+        CUDA_ARCH="-gencode=arch=compute_100,code=sm_100 -gencode=arch=compute_90,code=sm_90"
+        echo "Using Blackwell (B200) + Hopper architecture"
+    elif nvcc --help | grep -q "compute_90"; then
+        CUDA_ARCH="-gencode=arch=compute_90,code=sm_90 -gencode=arch=compute_80,code=sm_80"
+        echo "Using Hopper + Ampere architecture"
+    elif nvcc --help | grep -q "compute_80"; then
+        CUDA_ARCH="-gencode=arch=compute_80,code=sm_80 -gencode=arch=compute_70,code=sm_70"
+        echo "Using Ampere + Volta architecture"
+    else
+        CUDA_ARCH="-gencode=arch=compute_70,code=sm_70"
+        echo "Using Volta architecture"
+    fi
+    
+    CUDA_FLAGS="-shared -fPIC -O3 -Xcompiler -fPIC $CUDA_ARCH"
     
     nvcc $CUDA_FLAGS \
         -I"$CSRC_DIR" \
