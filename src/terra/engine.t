@@ -89,6 +89,14 @@ extern void launch_add_residual(float* a, const float* b, unsigned long long cou
 extern void launch_argmax(const float* logits, long long* output, int vocab_size, int batch_size, cwStream_t stream);
 extern void launch_top_p_sampling(const float* logits, long long* output, float temperature, float top_p, int vocab_size, int batch_size, const unsigned long long* random_seeds, cwStream_t stream);
 extern void launch_apply_rep_penalty(float* logits, const long long* past_tokens, int past_len, int vocab_size, float penalty, cwStream_t stream);
+extern void launch_paged_attention_prefill(const float* q, const float* k, const float* v, float* output, const int* page_table, int num_pages, int page_size, int num_heads, int head_dim, int seq_len, float scale, cwStream_t stream);
+extern void launch_paged_attention_decode(const float* q, const float* kv_cache_k, const float* kv_cache_v, float* output, const int* page_table, int num_pages, int page_size, int num_heads, int num_kv_heads, int head_dim, int past_len, float scale, cwStream_t stream);
+extern void launch_update_kv_cache(const float* k, const float* v, float* kv_cache_k, float* kv_cache_v, const int* page_table, int page_size, int num_kv_heads, int head_dim, int seq_len, int start_pos, cwStream_t stream);
+extern void launch_moe_gate(const float* hidden, const void* gate_weight, float* router_logits, int hidden_dim, int num_experts, int batch_size, int gate_dtype, cwStream_t stream);
+extern void launch_moe_topk(const float* router_logits, int* expert_indices, float* expert_weights, int num_experts, int top_k, int batch_size, cwStream_t stream);
+extern void launch_moe_dispatch(const float* input, float* expert_inputs, const int* expert_indices, int hidden_dim, int top_k, int batch_size, cwStream_t stream);
+extern void launch_moe_combine(const float* expert_outputs, const float* expert_weights, float* output, int hidden_dim, int top_k, int batch_size, cwStream_t stream);
+extern void launch_copy_hidden(const float* src, float* dst, unsigned long long count, cwStream_t stream);
 ]]
 
 struct CudaContext {
@@ -195,14 +203,25 @@ struct ModelConfig {
 
 struct LayerWeights {
     input_layernorm: CUdeviceptr
+    input_layernorm_dtype: int32
     post_attention_layernorm: CUdeviceptr
+    post_attention_layernorm_dtype: int32
     q_proj: CUdeviceptr
+    q_proj_dtype: int32
     k_proj: CUdeviceptr
+    k_proj_dtype: int32
     v_proj: CUdeviceptr
+    v_proj_dtype: int32
     o_proj: CUdeviceptr
+    o_proj_dtype: int32
     gate_proj: CUdeviceptr
+    gate_proj_dtype: int32
     up_proj: CUdeviceptr
+    up_proj_dtype: int32
     down_proj: CUdeviceptr
+    down_proj_dtype: int32
+    router_weight: CUdeviceptr
+    router_dtype: int32
     q_scale: float
     k_scale: float
     v_scale: float
@@ -231,6 +250,7 @@ struct EngineHandle {
     lm_head_weight: CUdeviceptr
     lm_head_dtype: int32
     final_norm: CUdeviceptr
+    final_norm_dtype: int32
     layer_weights: &LayerWeights
     num_layer_weights: int32
     hidden_buffer: CUdeviceptr
@@ -240,6 +260,18 @@ struct EngineHandle {
     mlp_buffer: CUdeviceptr
     logits_buffer: CUdeviceptr
     lm_head_f32_buffer: CUdeviceptr
+    q_buffer: CUdeviceptr
+    k_buffer: CUdeviceptr
+    v_buffer: CUdeviceptr
+    gate_buffer: CUdeviceptr
+    up_buffer: CUdeviceptr
+    down_buffer: CUdeviceptr
+    router_logits_buffer: CUdeviceptr
+    expert_indices_buffer: CUdeviceptr
+    expert_weights_buffer: CUdeviceptr
+    expert_inputs_buffer: CUdeviceptr
+    expert_outputs_buffer: CUdeviceptr
+    norm_buffer: CUdeviceptr
     hidden_buffer_cpu: &float
     logits_buffer_cpu: &float
     lm_head_f32_buffer_cpu: &float
@@ -896,6 +928,11 @@ terra allocate_inference_buffers(handle: &EngineHandle) : int32
     var hidden_size = [uint64](handle.max_batch) * [uint64](handle.max_seq) * [uint64](handle.config.hidden_dim) * 4
     var vocab_size = [uint64](handle.max_batch) * [uint64](handle.config.vocab_size) * 4
     var lm_head_size = [uint64](handle.config.vocab_size) * [uint64](handle.config.hidden_dim) * 4
+    var qkv_size = [uint64](handle.max_batch) * [uint64](handle.max_seq) * [uint64](handle.config.num_heads) * [uint64](handle.config.head_dim) * 4
+    var mlp_size = [uint64](handle.max_batch) * [uint64](handle.max_seq) * [uint64](handle.config.intermediate_size) * 4
+    var router_size = [uint64](handle.max_batch) * [uint64](handle.max_seq) * [uint64](handle.config.num_experts) * 4
+    var expert_idx_size = [uint64](handle.max_batch) * [uint64](handle.max_seq) * [uint64](handle.config.top_k_experts) * 4
+    var expert_io_size = [uint64](handle.max_batch) * [uint64](handle.max_seq) * [uint64](handle.config.top_k_experts) * [uint64](handle.config.hidden_dim) * 4
     if handle.use_gpu == 1 then
         if cw.cwMalloc(&handle.hidden_buffer, hidden_size) ~= CW_SUCCESS then return -1 end
         if cw.cwMalloc(&handle.residual_buffer, hidden_size) ~= CW_SUCCESS then return -1 end
@@ -904,6 +941,18 @@ terra allocate_inference_buffers(handle: &EngineHandle) : int32
         if cw.cwMalloc(&handle.mlp_buffer, hidden_size * 4) ~= CW_SUCCESS then return -1 end
         if cw.cwMalloc(&handle.logits_buffer, vocab_size) ~= CW_SUCCESS then return -1 end
         if cw.cwMalloc(&handle.lm_head_f32_buffer, lm_head_size) ~= CW_SUCCESS then return -1 end
+        if cw.cwMalloc(&handle.q_buffer, qkv_size) ~= CW_SUCCESS then return -1 end
+        if cw.cwMalloc(&handle.k_buffer, qkv_size) ~= CW_SUCCESS then return -1 end
+        if cw.cwMalloc(&handle.v_buffer, qkv_size) ~= CW_SUCCESS then return -1 end
+        if cw.cwMalloc(&handle.gate_buffer, mlp_size) ~= CW_SUCCESS then return -1 end
+        if cw.cwMalloc(&handle.up_buffer, mlp_size) ~= CW_SUCCESS then return -1 end
+        if cw.cwMalloc(&handle.down_buffer, mlp_size) ~= CW_SUCCESS then return -1 end
+        if cw.cwMalloc(&handle.router_logits_buffer, router_size) ~= CW_SUCCESS then return -1 end
+        if cw.cwMalloc(&handle.expert_indices_buffer, expert_idx_size) ~= CW_SUCCESS then return -1 end
+        if cw.cwMalloc(&handle.expert_weights_buffer, expert_idx_size) ~= CW_SUCCESS then return -1 end
+        if cw.cwMalloc(&handle.expert_inputs_buffer, expert_io_size) ~= CW_SUCCESS then return -1 end
+        if cw.cwMalloc(&handle.expert_outputs_buffer, expert_io_size) ~= CW_SUCCESS then return -1 end
+        if cw.cwMalloc(&handle.norm_buffer, hidden_size) ~= CW_SUCCESS then return -1 end
         cbw.cbwCreate(&handle.cublas_handle)
         cbw.cbwSetStream(handle.cublas_handle, handle.cuda_contexts[0].stream)
     else
@@ -1182,23 +1231,174 @@ terra check_stop_token(token: int64, stop_tokens: &int64, num_stop: int32) : int
     return 0
 end
 
+terra run_layer_forward_gpu(handle: &EngineHandle, layer_idx: int32, seq_len: int32, start_pos: int32, page_table: &int32, num_pages: int32, is_prefill: int32) : int32
+    var hidden_dim = handle.config.hidden_dim
+    var num_heads = handle.config.num_heads
+    var num_kv_heads = handle.config.num_kv_heads
+    var head_dim = handle.config.head_dim
+    var num_experts = handle.config.num_experts
+    var top_k = handle.config.top_k_experts
+    var intermediate_size = handle.config.intermediate_size
+    var rms_eps = handle.config.rms_norm_eps
+    var rope_theta = handle.config.rope_base
+    var stream = handle.cuda_contexts[0].stream
+    var lw = &handle.layer_weights[layer_idx]
+    var hidden = [&float](handle.hidden_buffer)
+    var residual = [&float](handle.residual_buffer)
+    var norm_out = [&float](handle.norm_buffer)
+    var q = [&float](handle.q_buffer)
+    var k = [&float](handle.k_buffer)
+    var v = [&float](handle.v_buffer)
+    var attn_out = [&float](handle.attn_out_buffer)
+    var gate_out = [&float](handle.gate_buffer)
+    var up_out = [&float](handle.up_buffer)
+    var down_out = [&float](handle.down_buffer)
+    var router_logits = [&float](handle.router_logits_buffer)
+    var expert_indices = [&int32](handle.expert_indices_buffer)
+    var expert_weights = [&float](handle.expert_weights_buffer)
+    var expert_inputs = [&float](handle.expert_inputs_buffer)
+    var expert_outputs = [&float](handle.expert_outputs_buffer)
+    kern.launch_copy_hidden(hidden, residual, seq_len * hidden_dim, stream)
+    if lw.input_layernorm_dtype == 1 then
+        kern.launch_fp8_dequantize([&opaque](lw.input_layernorm), [&float](handle.mlp_buffer), hidden_dim, stream)
+        kern.launch_rms_norm(hidden, [&float](handle.mlp_buffer), norm_out, hidden_dim, seq_len, rms_eps, stream)
+    else
+        kern.launch_rms_norm(hidden, [&float](lw.input_layernorm), norm_out, hidden_dim, seq_len, rms_eps, stream)
+    end
+    var alpha: float = 1.0f
+    var beta: float = 0.0f
+    var qkv_dim = num_heads * head_dim
+    var kv_dim = num_kv_heads * head_dim
+    if lw.q_proj_dtype == 1 then
+        kern.launch_fp8_dequantize([&opaque](lw.q_proj), [&float](handle.qkv_buffer), qkv_dim * hidden_dim, stream)
+        cbw.cbwSgemm(handle.cublas_handle, 0, 0, qkv_dim, seq_len, hidden_dim, &alpha, [&float](handle.qkv_buffer), qkv_dim, norm_out, hidden_dim, &beta, q, qkv_dim)
+    else
+        cbw.cbwSgemm(handle.cublas_handle, 0, 0, qkv_dim, seq_len, hidden_dim, &alpha, [&float](lw.q_proj), qkv_dim, norm_out, hidden_dim, &beta, q, qkv_dim)
+    end
+    if lw.k_proj_dtype == 1 then
+        kern.launch_fp8_dequantize([&opaque](lw.k_proj), [&float](handle.qkv_buffer), kv_dim * hidden_dim, stream)
+        cbw.cbwSgemm(handle.cublas_handle, 0, 0, kv_dim, seq_len, hidden_dim, &alpha, [&float](handle.qkv_buffer), kv_dim, norm_out, hidden_dim, &beta, k, kv_dim)
+    else
+        cbw.cbwSgemm(handle.cublas_handle, 0, 0, kv_dim, seq_len, hidden_dim, &alpha, [&float](lw.k_proj), kv_dim, norm_out, hidden_dim, &beta, k, kv_dim)
+    end
+    if lw.v_proj_dtype == 1 then
+        kern.launch_fp8_dequantize([&opaque](lw.v_proj), [&float](handle.qkv_buffer), kv_dim * hidden_dim, stream)
+        cbw.cbwSgemm(handle.cublas_handle, 0, 0, kv_dim, seq_len, hidden_dim, &alpha, [&float](handle.qkv_buffer), kv_dim, norm_out, hidden_dim, &beta, v, kv_dim)
+    else
+        cbw.cbwSgemm(handle.cublas_handle, 0, 0, kv_dim, seq_len, hidden_dim, &alpha, [&float](lw.v_proj), kv_dim, norm_out, hidden_dim, &beta, v, kv_dim)
+    end
+    kern.launch_rope(q, k, head_dim, num_heads, seq_len, start_pos, rope_theta, stream)
+    var layer_kv_offset = [uint64](layer_idx) * handle.kv_cache.bytes_per_page * [uint64](handle.kv_cache.max_pages)
+    var layer_k_cache = [&float]([uint64](handle.kv_cache.k_cache) + layer_kv_offset)
+    var layer_v_cache = [&float]([uint64](handle.kv_cache.v_cache) + layer_kv_offset)
+    kern.launch_update_kv_cache(k, v, layer_k_cache, layer_v_cache, page_table, handle.kv_cache.page_size, num_kv_heads, head_dim, seq_len, start_pos, stream)
+    var attn_scale = 1.0f / math_h.sqrtf([float](head_dim))
+    if is_prefill == 1 then
+        kern.launch_paged_attention_prefill(q, k, v, attn_out, page_table, num_pages, handle.kv_cache.page_size, num_heads, head_dim, seq_len, attn_scale, stream)
+    else
+        var past_len = start_pos + seq_len
+        kern.launch_paged_attention_decode(q, layer_k_cache, layer_v_cache, attn_out, page_table, num_pages, handle.kv_cache.page_size, num_heads, num_kv_heads, head_dim, past_len, attn_scale, stream)
+    end
+    if lw.o_proj_dtype == 1 then
+        kern.launch_fp8_dequantize([&opaque](lw.o_proj), [&float](handle.qkv_buffer), hidden_dim * qkv_dim, stream)
+        cbw.cbwSgemm(handle.cublas_handle, 0, 0, hidden_dim, seq_len, qkv_dim, &alpha, [&float](handle.qkv_buffer), hidden_dim, attn_out, qkv_dim, &beta, hidden, hidden_dim)
+    else
+        cbw.cbwSgemm(handle.cublas_handle, 0, 0, hidden_dim, seq_len, qkv_dim, &alpha, [&float](lw.o_proj), hidden_dim, attn_out, qkv_dim, &beta, hidden, hidden_dim)
+    end
+    kern.launch_add_residual(hidden, residual, seq_len * hidden_dim, stream)
+    kern.launch_copy_hidden(hidden, residual, seq_len * hidden_dim, stream)
+    if lw.post_attention_layernorm_dtype == 1 then
+        kern.launch_fp8_dequantize([&opaque](lw.post_attention_layernorm), [&float](handle.mlp_buffer), hidden_dim, stream)
+        kern.launch_rms_norm(hidden, [&float](handle.mlp_buffer), norm_out, hidden_dim, seq_len, rms_eps, stream)
+    else
+        kern.launch_rms_norm(hidden, [&float](lw.post_attention_layernorm), norm_out, hidden_dim, seq_len, rms_eps, stream)
+    end
+    if num_experts > 1 then
+        kern.launch_moe_gate(norm_out, [&opaque](lw.router_weight), router_logits, hidden_dim, num_experts, seq_len, lw.router_dtype, stream)
+        kern.launch_moe_topk(router_logits, expert_indices, expert_weights, num_experts, top_k, seq_len, stream)
+        kern.launch_moe_dispatch(norm_out, expert_inputs, expert_indices, hidden_dim, top_k, seq_len, stream)
+        for e = 0, top_k do
+            var expert_offset = [uint64](e) * [uint64](seq_len) * [uint64](hidden_dim)
+            var expert_in = &expert_inputs[expert_offset]
+            var gate_out_e = &gate_out[e * seq_len * intermediate_size]
+            var up_out_e = &up_out[e * seq_len * intermediate_size]
+            var expert_out_e = &expert_outputs[expert_offset]
+            if lw.gate_proj_dtype == 1 then
+                kern.launch_fp8_dequantize([&opaque](lw.gate_proj), [&float](handle.mlp_buffer), intermediate_size * hidden_dim, stream)
+                cbw.cbwSgemm(handle.cublas_handle, 0, 0, intermediate_size, seq_len, hidden_dim, &alpha, [&float](handle.mlp_buffer), intermediate_size, expert_in, hidden_dim, &beta, gate_out_e, intermediate_size)
+            else
+                cbw.cbwSgemm(handle.cublas_handle, 0, 0, intermediate_size, seq_len, hidden_dim, &alpha, [&float](lw.gate_proj), intermediate_size, expert_in, hidden_dim, &beta, gate_out_e, intermediate_size)
+            end
+            if lw.up_proj_dtype == 1 then
+                kern.launch_fp8_dequantize([&opaque](lw.up_proj), [&float](handle.mlp_buffer), intermediate_size * hidden_dim, stream)
+                cbw.cbwSgemm(handle.cublas_handle, 0, 0, intermediate_size, seq_len, hidden_dim, &alpha, [&float](handle.mlp_buffer), intermediate_size, expert_in, hidden_dim, &beta, up_out_e, intermediate_size)
+            else
+                cbw.cbwSgemm(handle.cublas_handle, 0, 0, intermediate_size, seq_len, hidden_dim, &alpha, [&float](lw.up_proj), intermediate_size, expert_in, hidden_dim, &beta, up_out_e, intermediate_size)
+            end
+            kern.launch_swiglu(gate_out_e, up_out_e, gate_out_e, seq_len * intermediate_size, stream)
+            if lw.down_proj_dtype == 1 then
+                kern.launch_fp8_dequantize([&opaque](lw.down_proj), [&float](handle.mlp_buffer), hidden_dim * intermediate_size, stream)
+                cbw.cbwSgemm(handle.cublas_handle, 0, 0, hidden_dim, seq_len, intermediate_size, &alpha, [&float](handle.mlp_buffer), hidden_dim, gate_out_e, intermediate_size, &beta, expert_out_e, hidden_dim)
+            else
+                cbw.cbwSgemm(handle.cublas_handle, 0, 0, hidden_dim, seq_len, intermediate_size, &alpha, [&float](lw.down_proj), hidden_dim, gate_out_e, intermediate_size, &beta, expert_out_e, hidden_dim)
+            end
+        end
+        kern.launch_moe_combine(expert_outputs, expert_weights, hidden, hidden_dim, top_k, seq_len, stream)
+    else
+        if lw.gate_proj_dtype == 1 then
+            kern.launch_fp8_dequantize([&opaque](lw.gate_proj), [&float](handle.mlp_buffer), intermediate_size * hidden_dim, stream)
+            cbw.cbwSgemm(handle.cublas_handle, 0, 0, intermediate_size, seq_len, hidden_dim, &alpha, [&float](handle.mlp_buffer), intermediate_size, norm_out, hidden_dim, &beta, gate_out, intermediate_size)
+        else
+            cbw.cbwSgemm(handle.cublas_handle, 0, 0, intermediate_size, seq_len, hidden_dim, &alpha, [&float](lw.gate_proj), intermediate_size, norm_out, hidden_dim, &beta, gate_out, intermediate_size)
+        end
+        if lw.up_proj_dtype == 1 then
+            kern.launch_fp8_dequantize([&opaque](lw.up_proj), [&float](handle.mlp_buffer), intermediate_size * hidden_dim, stream)
+            cbw.cbwSgemm(handle.cublas_handle, 0, 0, intermediate_size, seq_len, hidden_dim, &alpha, [&float](handle.mlp_buffer), intermediate_size, norm_out, hidden_dim, &beta, up_out, intermediate_size)
+        else
+            cbw.cbwSgemm(handle.cublas_handle, 0, 0, intermediate_size, seq_len, hidden_dim, &alpha, [&float](lw.up_proj), intermediate_size, norm_out, hidden_dim, &beta, up_out, intermediate_size)
+        end
+        kern.launch_swiglu(gate_out, up_out, gate_out, seq_len * intermediate_size, stream)
+        if lw.down_proj_dtype == 1 then
+            kern.launch_fp8_dequantize([&opaque](lw.down_proj), [&float](handle.mlp_buffer), hidden_dim * intermediate_size, stream)
+            cbw.cbwSgemm(handle.cublas_handle, 0, 0, hidden_dim, seq_len, intermediate_size, &alpha, [&float](handle.mlp_buffer), hidden_dim, gate_out, intermediate_size, &beta, hidden, hidden_dim)
+        else
+            cbw.cbwSgemm(handle.cublas_handle, 0, 0, hidden_dim, seq_len, intermediate_size, &alpha, [&float](lw.down_proj), hidden_dim, gate_out, intermediate_size, &beta, hidden, hidden_dim)
+        end
+    end
+    kern.launch_add_residual(hidden, residual, seq_len * hidden_dim, stream)
+    return 0
+end
+
 terra run_prefill(handle: &EngineHandle, state: &RequestState) : int32
     if handle.embed_weight == 0 then
-        C.printf("Warning: No embedding weight loaded, skipping prefill\n")
         state.is_prefill_done = 1
         return 0
     end
     var hidden_dim = handle.config.hidden_dim
+    var num_layers = handle.config.num_layers
+    var vocab_size = handle.config.vocab_size
     var seq_len = state.seq_len
-    var hidden = [&float](handle.hidden_buffer)
+    var stream = handle.cuda_contexts[0].stream
     if handle.use_gpu == 1 then
         var token_ids_d: CUdeviceptr = 0
         cw.cwMalloc(&token_ids_d, seq_len * sizeof(int64))
         cw.cwMemcpyH2D(token_ids_d, state.past_tokens, seq_len * sizeof(int64))
-        kern.launch_embedding_lookup([&opaque](handle.embed_weight), [&int64](token_ids_d), [&float](handle.hidden_buffer), hidden_dim, seq_len, handle.embed_dtype, handle.cuda_contexts[0].stream)
-        cw.cwStreamSynchronize(handle.cuda_contexts[0].stream)
+        kern.launch_embedding_lookup([&opaque](handle.embed_weight), [&int64](token_ids_d), [&float](handle.hidden_buffer), hidden_dim, seq_len, handle.embed_dtype, stream)
         cw.cwFree(token_ids_d)
+        if handle.num_layer_weights > 0 then
+            for layer_idx = 0, num_layers do
+                if layer_idx < handle.num_layer_weights then
+                    run_layer_forward_gpu(handle, layer_idx, seq_len, 0, state.page_indices, state.num_pages, 1)
+                end
+            end
+        end
+        if handle.final_norm ~= 0 then
+            kern.launch_rms_norm([&float](handle.hidden_buffer), [&float](handle.final_norm), [&float](handle.norm_buffer), hidden_dim, seq_len, handle.config.rms_norm_eps, stream)
+            kern.launch_copy_hidden([&float](handle.norm_buffer), [&float](handle.hidden_buffer), seq_len * hidden_dim, stream)
+        end
+        cw.cwStreamSynchronize(stream)
     else
+        var hidden = [&float](handle.hidden_buffer)
         embedding_lookup_cpu([&int8](handle.embed_weight), state.past_tokens, hidden, hidden_dim, seq_len, handle.embed_dtype)
     end
     state.is_prefill_done = 1
@@ -1208,6 +1408,8 @@ end
 terra run_decode_step(handle: &EngineHandle, state: &RequestState, next_token: &int64) : int32
     var vocab_size = handle.config.vocab_size
     var hidden_dim = handle.config.hidden_dim
+    var num_layers = handle.config.num_layers
+    var stream = handle.cuda_contexts[0].stream
     if handle.lm_head_weight ~= 0 then
         if handle.use_gpu == 1 then
             var last_pos = state.past_len - 1
@@ -1216,9 +1418,21 @@ terra run_decode_step(handle: &EngineHandle, state: &RequestState, next_token: &
             var last_token = state.past_tokens[last_pos]
             cw.cwMalloc(&token_ids_d, sizeof(int64))
             cw.cwMemcpyH2D(token_ids_d, &last_token, sizeof(int64))
-            kern.launch_embedding_lookup([&opaque](handle.embed_weight), [&int64](token_ids_d), [&float](handle.hidden_buffer), hidden_dim, 1, handle.embed_dtype, handle.cuda_contexts[0].stream)
+            kern.launch_embedding_lookup([&opaque](handle.embed_weight), [&int64](token_ids_d), [&float](handle.hidden_buffer), hidden_dim, 1, handle.embed_dtype, stream)
+            cw.cwFree(token_ids_d)
+            if handle.num_layer_weights > 0 then
+                for layer_idx = 0, num_layers do
+                    if layer_idx < handle.num_layer_weights then
+                        run_layer_forward_gpu(handle, layer_idx, 1, state.past_len, state.page_indices, state.num_pages, 0)
+                    end
+                end
+            end
+            if handle.final_norm ~= 0 then
+                kern.launch_rms_norm([&float](handle.hidden_buffer), [&float](handle.final_norm), [&float](handle.norm_buffer), hidden_dim, 1, handle.config.rms_norm_eps, stream)
+                kern.launch_copy_hidden([&float](handle.norm_buffer), [&float](handle.hidden_buffer), hidden_dim, stream)
+            end
             if handle.lm_head_dtype == 1 then
-                kern.launch_fp8_dequantize([&opaque](handle.lm_head_weight), [&float](handle.lm_head_f32_buffer), vocab_size * hidden_dim, handle.cuda_contexts[0].stream)
+                kern.launch_fp8_dequantize([&opaque](handle.lm_head_weight), [&float](handle.lm_head_f32_buffer), vocab_size * hidden_dim, stream)
             end
             var alpha: float = 1.0f
             var beta: float = 0.0f
@@ -1227,13 +1441,12 @@ terra run_decode_step(handle: &EngineHandle, state: &RequestState, next_token: &
                 lm_weight = handle.lm_head_weight
             end
             cbw.cbwSgemm(handle.cublas_handle, 0, 1, 1, vocab_size, hidden_dim, &alpha, [&float](handle.hidden_buffer), 1, [&float](lm_weight), vocab_size, &beta, [&float](handle.logits_buffer), 1)
-            cw.cwStreamSynchronize(handle.cuda_contexts[0].stream)
+            cw.cwStreamSynchronize(stream)
             var seed = [uint64](state.request_id * 31 + state.past_len * 17)
             seed = seed * 6364136223846793005ULL + 1442695040888963407ULL
-            kern.launch_top_p_sampling([&float](handle.logits_buffer), &state.gpu_next_token, state.temperature, state.top_p, vocab_size, 1, &seed, handle.cuda_contexts[0].stream)
-            cw.cwStreamSynchronize(handle.cuda_contexts[0].stream)
+            kern.launch_top_p_sampling([&float](handle.logits_buffer), &state.gpu_next_token, state.temperature, state.top_p, vocab_size, 1, &seed, stream)
+            cw.cwStreamSynchronize(stream)
             cw.cwMemcpyD2H(next_token, [CUdeviceptr](state.gpu_next_token), sizeof(int64))
-            cw.cwFree(token_ids_d)
         else
             var hidden = [&float](handle.hidden_buffer_cpu)
             var logits = [&float](handle.logits_buffer_cpu)
@@ -1524,6 +1737,18 @@ terra free_engine(handle: &EngineHandle) : void
         if handle.mlp_buffer ~= 0 then cw.cwFree(handle.mlp_buffer) end
         if handle.logits_buffer ~= 0 then cw.cwFree(handle.logits_buffer) end
         if handle.lm_head_f32_buffer ~= 0 then cw.cwFree(handle.lm_head_f32_buffer) end
+        if handle.q_buffer ~= 0 then cw.cwFree(handle.q_buffer) end
+        if handle.k_buffer ~= 0 then cw.cwFree(handle.k_buffer) end
+        if handle.v_buffer ~= 0 then cw.cwFree(handle.v_buffer) end
+        if handle.gate_buffer ~= 0 then cw.cwFree(handle.gate_buffer) end
+        if handle.up_buffer ~= 0 then cw.cwFree(handle.up_buffer) end
+        if handle.down_buffer ~= 0 then cw.cwFree(handle.down_buffer) end
+        if handle.router_logits_buffer ~= 0 then cw.cwFree(handle.router_logits_buffer) end
+        if handle.expert_indices_buffer ~= 0 then cw.cwFree(handle.expert_indices_buffer) end
+        if handle.expert_weights_buffer ~= 0 then cw.cwFree(handle.expert_weights_buffer) end
+        if handle.expert_inputs_buffer ~= 0 then cw.cwFree(handle.expert_inputs_buffer) end
+        if handle.expert_outputs_buffer ~= 0 then cw.cwFree(handle.expert_outputs_buffer) end
+        if handle.norm_buffer ~= 0 then cw.cwFree(handle.norm_buffer) end
         if handle.cublas_handle ~= nil then cbw.cbwDestroy(handle.cublas_handle) end
     else
         if handle.hidden_buffer ~= 0 then stdlib.free([&opaque](handle.hidden_buffer)) end

@@ -153,11 +153,16 @@ void free_engine(EngineHandle* handle)
 
 ### Current Status
 
-- Engine provides embedding -> lm_head forward pass (no transformer layers yet)
-- GPU mode uses cuBLAS GEMM and kernel-based sampling
-- CPU mode uses pre-allocated buffers for fallback
-- Full GLM-4.7 layer stack (92 layers, MoE, attention) not yet implemented
-- Target: 3000+ tok/s requires complete GPU forward pass with attention and MoE
+- Full 92-layer transformer forward pass implemented in run_layer_forward_gpu
+- Layer forward: RMSNorm → QKV projection → RoPE → paged attention → O projection → residual → post-attention RMSNorm → MoE/FFN
+- FP8 dequantization before all projections when weights are FP8 (dtype==1)
+- Layer-specific KV cache addressing with layer offsets
+- MoE routing with top-k expert selection and per-expert matmuls
+- GPU buffers for: q, k, v, gate, up, down, router_logits, expert_indices/weights/inputs/outputs, norm
+- LayerWeights struct includes dtype fields for all weights
+- run_prefill iterates through all 92 layers with prefill attention
+- run_decode_step iterates through all 92 layers with decode attention and final RMSNorm + lm_head
+- Target: 3000+ tok/s on 8x B200 with tensor parallel and expert parallel
 
 ## CUDA/C Source Files (csrc/)
 

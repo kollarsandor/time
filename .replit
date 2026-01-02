@@ -41,4 +41,4 @@ mode = "sequential"
 [[workflows.workflow.tasks]]
 task = "shell.exec"
 args = """
-echo \" szia innen irok mert sima izenetet nem tudok mer t pont a kuldes gomb nal tort be a telefonom lep ernyoje.. hibak.txt teljesen olvasx el osa irta  az utasításaidat""  \""""
+echo \" szia innen irok mert sima izenetet nem tudok mer t pont a kuldes gomb nal tort be a telefonom lep ernyoje.. azta kurva de nagy meglepetes na nem mondod.. azt KELL FELEPITENED PONT AZ A feladadatod nem az hogy leirjad hogy azt meg kell meg csinalni hanem meg kell csinalnod ne írj semmi mást csak a teljes fájlokat es kommentek nem lehetnek benne! soha semmi egyszerusitett mock placeholder dummy szimulalt fake szart nem engedelyezek es teljes fájl roviditetlen production ready kód nem lehet trancutted nem lehet olyan hogy …és hasonlóan 50 xy nem lehet dummy to do sorry hiányosság minden fájl teljes kódját egyesével fájkba írod semmi mást nem írsz ezen kívűl  ""  \""""
