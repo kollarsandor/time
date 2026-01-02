@@ -14,6 +14,10 @@ from concurrent.futures import ThreadPoolExecutor
 app = modal.App("glm-4.7-fp8-inference")
 
 volume = modal.Volume.from_name("glm-4.7-fp8-weights", create_if_missing=True)
+build_volume = modal.Volume.from_name("glm-4.7-fp8-build", create_if_missing=True)
+
+SRC_DIR = os.path.join(os.path.dirname(__file__), "..")
+CSRC_DIR = os.path.join(os.path.dirname(__file__), "..", "..", "csrc")
 
 image = (
     modal.Image.from_registry("nvidia/cuda:12.8.0-devel-ubuntu22.04")
@@ -641,28 +645,39 @@ def download_model() -> str:
     volume.commit()
     return "Model downloaded successfully"
 
+def get_local_source_files() -> Dict[str, str]:
+    files = {}
+    futhark_path = os.path.join(SRC_DIR, "futhark", "kernels.fut")
+    if os.path.exists(futhark_path):
+        with open(futhark_path, "r") as f:
+            files["kernels.fut"] = f.read()
+    terra_path = os.path.join(SRC_DIR, "terra", "engine.t")
+    if os.path.exists(terra_path):
+        with open(terra_path, "r") as f:
+            files["engine.t"] = f.read()
+    if os.path.exists(CSRC_DIR):
+        for fname in os.listdir(CSRC_DIR):
+            fpath = os.path.join(CSRC_DIR, fname)
+            if os.path.isfile(fpath):
+                with open(fpath, "r") as f:
+                    files[fname] = f.read()
+    return files
+
+LOCAL_SOURCES = get_local_source_files()
+
 @app.function(
     image=image,
     gpu="B200:8",
-    volumes={"/model": volume},
+    volumes={"/model": volume, "/build": build_volume},
     timeout=3600
 )
 def build_engine() -> str:
     import subprocess
     os.makedirs("/build", exist_ok=True)
-    kernel_src_path = "/app/src/futhark/kernels.fut"
-    if os.path.exists(kernel_src_path):
-        with open(kernel_src_path, "r") as f:
-            kernel_src = f.read()
-    else:
-        kernel_src_path = os.path.join(os.path.dirname(__file__), "..", "futhark", "kernels.fut")
-        if os.path.exists(kernel_src_path):
-            with open(kernel_src_path, "r") as f:
-                kernel_src = f.read()
-        else:
-            return "Futhark kernel source not found"
+    if "kernels.fut" not in LOCAL_SOURCES:
+        return "Futhark kernel source not found"
     with open("/build/kernels.fut", "w") as f:
-        f.write(kernel_src)
+        f.write(LOCAL_SOURCES["kernels.fut"])
     result = subprocess.run(
         ["futhark", "cuda", "--library", "/build/kernels.fut", "-o", "/build/kernels"],
         capture_output=True,
@@ -671,19 +686,14 @@ def build_engine() -> str:
     )
     if result.returncode != 0:
         return f"Futhark build failed: {result.stderr}"
-    terra_src_path = "/app/src/terra/engine.t"
-    if os.path.exists(terra_src_path):
-        with open(terra_src_path, "r") as f:
-            terra_src = f.read()
-    else:
-        terra_src_path = os.path.join(os.path.dirname(__file__), "..", "terra", "engine.t")
-        if os.path.exists(terra_src_path):
-            with open(terra_src_path, "r") as f:
-                terra_src = f.read()
-        else:
-            return "Terra engine source not found"
+    if "engine.t" not in LOCAL_SOURCES:
+        return "Terra engine source not found"
     with open("/build/engine.t", "w") as f:
-        f.write(terra_src)
+        f.write(LOCAL_SOURCES["engine.t"])
+    for fname, content in LOCAL_SOURCES.items():
+        if fname.endswith((".cu", ".h", ".c")):
+            with open(f"/build/{fname}", "w") as f:
+                f.write(content)
     result = subprocess.run(
         ["terra", "/build/engine.t"],
         capture_output=True,
@@ -695,12 +705,13 @@ def build_engine() -> str:
         return f"Terra build failed: {result.stderr}"
     if not os.path.exists("/build/engine.so"):
         return "Engine build completed but engine.so not found"
-    return "Build successful"
+    build_volume.commit()
+    return "Build successful - engine.so created"
 
 @app.cls(
     image=image,
     gpu="B200:8",
-    volumes={"/model": volume},
+    volumes={"/model": volume, "/build": build_volume},
     allow_concurrent_inputs=128
 )
 class InferenceServer:
@@ -782,7 +793,7 @@ class InferenceServer:
 @app.function(
     image=image,
     gpu="B200:8",
-    volumes={"/model": volume},
+    volumes={"/model": volume, "/build": build_volume},
     timeout=1800
 )
 def run_benchmark() -> Dict[str, Any]:
@@ -879,7 +890,7 @@ def run_benchmark() -> Dict[str, Any]:
 @app.function(
     image=image,
     gpu="B200:8",
-    volumes={"/model": volume},
+    volumes={"/model": volume, "/build": build_volume},
     timeout=300
 )
 def run_smoke_test() -> Dict[str, Any]:
