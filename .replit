@@ -25,9 +25,9 @@ args = "GLM-4.7 Inference Test"
 name = "GLM-4.7 Inference Test"
 author = "agent"
 
+[workflows.workflow.metadata]
+outputType = "console"
+
 [[workflows.workflow.tasks]]
 task = "shell.exec"
 args = "python3 run.py"
-
-[workflows.workflow.metadata]
-outputType = "console"
