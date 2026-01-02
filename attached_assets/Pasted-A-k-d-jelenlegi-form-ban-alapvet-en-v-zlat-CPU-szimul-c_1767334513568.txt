@@ -1,0 +1,57 @@
+A kód jelenlegi formában alapvetően “vázlat / CPU-szimuláció” jellegű, tele olyan hibákkal, amik miatt vagy nem fordul, vagy ha fut is, nem csinál valódi GPU-s GLM-4.7-FP8 inference-t.
+
+A legnagyobb piros zászlók (konkrétan ebből a kódból):
+	1.	A “decode” nem inference
+
+	•	terra decode_step(...) konkrétan ezt csinálja: @next_token_out = 1 → mindig 1-es tokent ad vissza, nincs logits, nincs sampling, nincs modell. Ez önmagában bizonyítja, hogy ez nem kész.
+
+	2.	Nincs valódi súlybetöltés / tensor pointerezés
+
+	•	Terra oldalon a safetensors header feldolgozás félkész: parse_safetensors_header csak allokál és visszatér, nem tölti fel a tensor metaadatokat.
+	•	get_tensor_ptr csak strcmp-el keres handle.weight_ptrs-ben, de handle.weight_ptrs sose kerül feltöltésre, tehát nem fog működni.
+
+	3.	KV cache CPU memóriában van, nem GPU-n
+
+	•	init_paged_kv_cache: calloc-al foglal float tömböket. Ez host RAM, nem HBM, nincs CUDA malloc, nincs unified/managed stratégia, nincs TMA/FA3.
+	•	page_table sincs ténylegesen összekötve a Futhark kernel oldalával.
+
+	4.	PagedAttention nem FA3/TMA-szint, és a Futhark implementáció sem korrekt/hatékony
+
+	•	A Futhark “paged_attention” része tömb-flatten + softmax + brutál map/reduce: ez nem vLLM-szerű PagedAttention, és nem fog skálázódni.
+	•	paged_attention_decode belül olyan konstrukciók vannak, amik extrém pazarlók (pl. drop a_start attn ++ replicate...), ez GPU-n is rossz.
+
+	5.	Continuous batching csak Python queue, nincs GPU-s scheduler
+
+	•	A “scheduler” csak Python-ban rendezget requesteket, de a compute lépések sorosak, lock-osak, és nincs valódi batch-képzés GPU kernel szinten.
+	•	Ez nem vLLM-style “continuous batching”, csak egy egyszerű queue.
+
+	6.	Sampling nem GPU-s, és top-p/repetition is CPU-s és drága
+
+	•	Futhark oldalon van sampling, de a pipeline nincs rádrótozva logitsra.
+	•	Python oldalon a fallback ágban random tokent dobál, ha nincs lib/handle.
+
+	7.	NCCL TP/EP nincs
+
+	•	Sehol nincs NCCL init, communicators, all-reduce/all-gather, tensor parallel, expert parallel. num_gpus=8 csak egy szám, nincs multi-GPU compute.
+
+	8.	MoE top-k=8/160 nincs end-to-end
+
+	•	Van pár MoE függvény Futharkban, de nincs integrálva a modell forwardba, nincs expert sharding, nincs EP routing, nincs dispatch/collect.
+
+	9.	Durva memóriabiztonsági/off-by-one hibák Terra-ban
+
+	•	Több helyen for i = 0, N do van, ami Terra/Lua-szerűen jellemzően inkluzív, így N+1 iteráció, out-of-bounds:
+	•	for i = 0, handle.num_shards do → ha num_shards=8, akkor 0..8 (9 iteráció), miközben 8 elem van.
+	•	Ugyanez num_layers * num_heads ciklusoknál, seq_len ciklusoknál, num_pages_needed ciklusoknál.
+	•	Ezek crash/UB kategória.
+
+	10.	A Modal build/run útvonalak sem stimmelnek
+
+	•	build_engine() olvas: "/app/src/futhark/kernels.fut" és "/app/src/terra/engine.t" — ez csak akkor létezik, ha a repo pontosan így van bemountolva Modalban. A kód nem garantálja.
+	•	InferenceServer.setup() "/build/engine.so"-t tölt, de a build ezt csak akkor hozza létre, ha a Terra futás és output path rendben van.
+
+	11.	A benchmark nem hiteles
+
+	•	Mivel a decode token = 1 konstans, “throughput” mérésed lényegében nem LLM inferencia, hanem loop/queue overhead + konstans token return.
+
+Összefoglalva: ez nem “production ready GLM-4.7-FP8”, hanem egy nagy, összedobott skeleton, amiben a legfontosabb részek hiányoznak vagy hamisak. Így nem várható a 3k tok/s, sőt a helyes működés sem.
