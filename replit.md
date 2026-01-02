@@ -74,13 +74,32 @@ High-performance inference engine for GLM-4.7-FP8 on 8x NVIDIA B200 GPUs via Mod
 ## Building
 
 Run the build script:
-```
+```bash
 bash scripts/build.sh
 ```
 
-This compiles:
-1. Futhark kernels to CUDA/OpenCL/multicore library
-2. Terra engine to shared library (engine.so)
+**Build Requirements:**
+- NVCC (CUDA compiler) - REQUIRED for production builds
+- Terra (release-1.2.0) - REQUIRED for engine.so compilation  
+- Futhark (0.25.14) - REQUIRED for GPU kernels
+
+**Build Modes:**
+- **Production (default):** Requires NVCC and Terra. Fails if engine.so not created.
+- **Development:** Set `ALLOW_CPU=1` to build CPU stubs for testing without GPU.
+
+```bash
+ALLOW_CPU=1 bash scripts/build.sh
+```
+
+**Build Output (in ./build/):**
+1. engine.so - Main inference engine (Terra compiled)
+2. libcudawrap.so - CUDA memory management
+3. libncclwrap.so - NCCL multi-GPU communication
+4. libcublaswrap.so - cuBLAS matrix operations
+5. libkernels.so - Custom CUDA kernels
+
+**Runtime Library Discovery:**
+engine.so uses rpath=$ORIGIN to find dependencies in the same directory.
 
 ## Deployment
 
