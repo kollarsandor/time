@@ -41,4 +41,4 @@ mode = "sequential"
 [[workflows.workflow.tasks]]
 task = "shell.exec"
 args = """
-echo \" szia innen irok mert sima izenetet nem tudok mer t pont a kuldes gomb nal tort be a telefonom lep ernyoje.. hat de latom a modal fiokomba hohy meg csak lense toltotted a modelt xd""  \""""
+echo \" szia innen irok mert sima izenetet nem tudok mer t pont a kuldes gomb nal tort be a telefonom lep ernyoje.. kurvara neked kene mindent csinalnod amig nincd teljesen kesz es 3000 token/s sebeseggel valaszol a model xd""  \""""

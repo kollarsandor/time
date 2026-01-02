@@ -35,7 +35,9 @@ image = (
         "libgmp-dev",
         "clang",
         "llvm",
-        "llvm-dev"
+        "llvm-dev",
+        "libnccl2",
+        "libnccl-dev"
     )
     .run_commands(
         "wget https://github.com/diku-dk/futhark/releases/download/nightly/futhark-nightly-linux-x86_64.tar.xz",
@@ -674,39 +676,56 @@ LOCAL_SOURCES = get_local_source_files()
 def build_engine() -> str:
     import subprocess
     os.makedirs("/build", exist_ok=True)
-    if "kernels.fut" not in LOCAL_SOURCES:
-        return "Futhark kernel source not found"
-    with open("/build/kernels.fut", "w") as f:
-        f.write(LOCAL_SOURCES["kernels.fut"])
-    result = subprocess.run(
-        ["futhark", "cuda", "--library", "/build/kernels.fut", "-o", "/build/kernels"],
-        capture_output=True,
-        text=True,
-        env={**os.environ, "CUDA_HOME": "/usr/local/cuda"}
-    )
-    if result.returncode != 0:
-        return f"Futhark build failed: {result.stderr}"
+    env = {
+        **os.environ,
+        "CUDA_HOME": "/usr/local/cuda",
+        "LD_LIBRARY_PATH": "/usr/local/cuda/lib64:/build",
+        "PATH": f"/usr/local/cuda/bin:{os.environ.get('PATH', '')}"
+    }
+    for fname, content in LOCAL_SOURCES.items():
+        with open(f"/build/{fname}", "w") as f:
+            f.write(content)
+    nvcc_flags = "-O3 -shared -Xcompiler -fPIC -arch=sm_90"
+    builds = [
+        (["nvcc"] + nvcc_flags.split() + ["-lcuda", "-o", "/build/libcudawrap.so", "/build/cuda_wrappers.cu"], "libcudawrap.so"),
+        (["nvcc"] + nvcc_flags.split() + ["-lnccl", "-o", "/build/libncclwrap.so", "/build/nccl_wrappers.cu"], "libncclwrap.so"),
+        (["nvcc"] + nvcc_flags.split() + ["-lcublas", "-lcublasLt", "-o", "/build/libcublaswrap.so", "/build/cublas_wrappers.cu"], "libcublaswrap.so"),
+        (["nvcc"] + nvcc_flags.split() + ["-o", "/build/libkernels.so", "/build/kernels.cu"], "libkernels.so"),
+    ]
+    for cmd, target in builds:
+        if not os.path.exists(f"/build/{target.replace('lib', '').replace('.so', '')}_wrappers.cu") and "kernels" not in target:
+            continue
+        result = subprocess.run(cmd, capture_output=True, text=True, env=env, cwd="/build")
+        if result.returncode != 0:
+            return f"NVCC build of {target} failed: {result.stderr}"
+    if "kernels.fut" in LOCAL_SOURCES:
+        with open("/build/kernels.fut", "w") as f:
+            f.write(LOCAL_SOURCES["kernels.fut"])
+        result = subprocess.run(
+            ["futhark", "cuda", "--library", "/build/kernels.fut", "-o", "/build/futhark_kernels"],
+            capture_output=True,
+            text=True,
+            env=env
+        )
+        if result.returncode != 0:
+            return f"Futhark build failed: {result.stderr}"
     if "engine.t" not in LOCAL_SOURCES:
         return "Terra engine source not found"
     with open("/build/engine.t", "w") as f:
         f.write(LOCAL_SOURCES["engine.t"])
-    for fname, content in LOCAL_SOURCES.items():
-        if fname.endswith((".cu", ".h", ".c")):
-            with open(f"/build/{fname}", "w") as f:
-                f.write(content)
     result = subprocess.run(
         ["terra", "/build/engine.t"],
         capture_output=True,
         text=True,
         cwd="/build",
-        env={**os.environ, "CUDA_HOME": "/usr/local/cuda", "LD_LIBRARY_PATH": "/usr/local/cuda/lib64"}
+        env=env
     )
     if result.returncode != 0:
         return f"Terra build failed: {result.stderr}"
     if not os.path.exists("/build/engine.so"):
         return "Engine build completed but engine.so not found"
     build_volume.commit()
-    return "Build successful - engine.so created"
+    return "Build successful - all libraries created"
 
 @app.cls(
     image=image,
@@ -925,18 +944,155 @@ def run_smoke_test() -> Dict[str, Any]:
         "stats": stats
     }
 
+@app.function(
+    image=image,
+    gpu="B200:8",
+    volumes={"/model": volume, "/build": build_volume},
+    timeout=300
+)
+def validate_build() -> Dict[str, Any]:
+    import subprocess
+    result = {
+        "engine_so_exists": os.path.exists("/build/engine.so"),
+        "model_exists": os.path.exists("/model/glm-4.7-fp8"),
+        "gpu_count": 0,
+        "cuda_available": False,
+        "nccl_available": False,
+        "engine_loads": False,
+        "errors": []
+    }
+    try:
+        gpu_check = subprocess.run(["nvidia-smi", "-L"], capture_output=True, text=True)
+        if gpu_check.returncode == 0:
+            result["cuda_available"] = True
+            result["gpu_count"] = gpu_check.stdout.count("GPU ")
+    except Exception as e:
+        result["errors"].append(f"nvidia-smi failed: {e}")
+    if result["engine_so_exists"]:
+        try:
+            lib = ctypes.CDLL("/build/engine.so")
+            result["engine_loads"] = True
+            if hasattr(lib, "get_engine_info"):
+                result["has_get_engine_info"] = True
+            if hasattr(lib, "init_engine"):
+                result["has_init_engine"] = True
+            if hasattr(lib, "prefill"):
+                result["has_prefill"] = True
+            if hasattr(lib, "decode_step"):
+                result["has_decode_step"] = True
+        except Exception as e:
+            result["errors"].append(f"engine.so load failed: {e}")
+    try:
+        nccl_check = subprocess.run(["ls", "/usr/lib/x86_64-linux-gnu/libnccl*"], capture_output=True, text=True, shell=True)
+        if "libnccl" in nccl_check.stdout:
+            result["nccl_available"] = True
+    except Exception:
+        pass
+    return result
+
+@app.function(
+    image=image,
+    gpu="B200:8",
+    volumes={"/model": volume, "/build": build_volume},
+    timeout=600
+)
+def run_throughput_benchmark(
+    num_requests: int = 64,
+    prompt_len: int = 256,
+    gen_len: int = 256,
+    duration_secs: int = 60
+) -> Dict[str, Any]:
+    import statistics
+    engine = InferenceEngine(
+        model_dir="/model/glm-4.7-fp8",
+        max_batch=64,
+        max_seq=4096,
+        num_gpus=8
+    )
+    engine.load_config()
+    engine_loaded = engine.load_engine("/build/engine.so")
+    engine.loader.load_index()
+    engine.loader.mmap_shards()
+    engine.load_tokenizer()
+    prompt = "The quick brown fox " * (prompt_len // 4)
+    for _ in range(num_requests):
+        params = SamplingParams(temperature=0.8, top_p=0.95, max_tokens=gen_len)
+        tokens = engine.tokenize(prompt)[:prompt_len]
+        engine.scheduler.add_request(tokens, params, [])
+    start = time.time()
+    total_tokens = 0
+    latencies = []
+    while time.time() - start < duration_secs and engine.scheduler.has_active_requests():
+        step_start = time.time()
+        tokens_gen = engine.step()
+        step_end = time.time()
+        total_tokens += tokens_gen
+        if tokens_gen > 0:
+            latencies.append((step_end - step_start) * 1000)
+    elapsed = time.time() - start
+    tps = total_tokens / elapsed if elapsed > 0 else 0
+    result = {
+        "total_tokens": total_tokens,
+        "elapsed_seconds": elapsed,
+        "tokens_per_second": tps,
+        "target_achieved": tps >= 3000,
+        "avg_step_latency_ms": statistics.mean(latencies) if latencies else 0,
+        "p50_latency_ms": statistics.median(latencies) if latencies else 0,
+        "p99_latency_ms": sorted(latencies)[int(len(latencies)*0.99)] if len(latencies) > 100 else (max(latencies) if latencies else 0),
+        "num_gpus": engine.num_gpus,
+        "engine_loaded": engine_loaded
+    }
+    engine.cleanup()
+    return result
+
 @app.local_entrypoint()
 def main() -> None:
-    print("Starting GLM-4.7-FP8 inference pipeline")
-    print("Downloading model...")
+    import sys
+    print("=" * 60)
+    print("GLM-4.7-FP8 Inference Pipeline")
+    print("Target: 3000+ tokens/second on 8x B200 GPUs")
+    print("=" * 60)
+    print("\n[1/5] Downloading model weights...")
     download_result = download_model.remote()
-    print(download_result)
-    print("Building engine...")
+    print(f"  Result: {download_result}")
+    print("\n[2/5] Building native engine...")
     build_result = build_engine.remote()
-    print(build_result)
-    print("Running smoke test...")
+    print(f"  Result: {build_result}")
+    if "failed" in build_result.lower():
+        print("ERROR: Build failed, cannot continue")
+        sys.exit(1)
+    print("\n[3/5] Validating build artifacts...")
+    validation = validate_build.remote()
+    print(f"  Engine SO exists: {validation['engine_so_exists']}")
+    print(f"  Engine loads: {validation['engine_loads']}")
+    print(f"  GPU count: {validation['gpu_count']}")
+    print(f"  CUDA available: {validation['cuda_available']}")
+    if validation['errors']:
+        print(f"  Errors: {validation['errors']}")
+    if not validation['engine_loads']:
+        print("ERROR: Engine validation failed")
+        sys.exit(1)
+    print("\n[4/5] Running smoke test...")
     smoke_result = run_smoke_test.remote()
-    print(json.dumps(smoke_result, indent=2))
-    print("Running benchmark...")
-    benchmark_results = run_benchmark.remote()
-    print(json.dumps(benchmark_results, indent=2))
+    print(f"  Prompt: {smoke_result['prompt']}")
+    print(f"  Output: {smoke_result['output'][:100]}...")
+    print(f"  Engine loaded: {smoke_result['engine_loaded']}")
+    print("\n[5/5] Running throughput benchmark (60s)...")
+    benchmark = run_throughput_benchmark.remote(
+        num_requests=64,
+        prompt_len=256,
+        gen_len=256,
+        duration_secs=60
+    )
+    print(f"\n{'=' * 60}")
+    print("BENCHMARK RESULTS")
+    print(f"{'=' * 60}")
+    print(f"  Total tokens generated: {benchmark['total_tokens']}")
+    print(f"  Elapsed time: {benchmark['elapsed_seconds']:.2f}s")
+    print(f"  Throughput: {benchmark['tokens_per_second']:.1f} tokens/sec")
+    print(f"  Target (3000 tok/s): {'ACHIEVED' if benchmark['target_achieved'] else 'NOT YET'}")
+    print(f"  Avg latency: {benchmark['avg_step_latency_ms']:.2f}ms")
+    print(f"  P50 latency: {benchmark['p50_latency_ms']:.2f}ms")
+    print(f"  P99 latency: {benchmark['p99_latency_ms']:.2f}ms")
+    print(f"  GPUs used: {benchmark['num_gpus']}")
+    print(f"{'=' * 60}")
