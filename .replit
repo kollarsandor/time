@@ -1,0 +1,9 @@
+run = "nasm -f elf32 hello.asm && ld -m elf_i386 hello.o -o hello && ./hello"
+entrypoint = "hello.asm"
+modules = ["nix"]
+
+[nix]
+channel = "stable-24_05"
+
+[agent]
+expertMode = true
