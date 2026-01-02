@@ -1,75 +1,73 @@
-Hibák / miért nem production ready most
+ne írj semmi mást csak a teljes fájlokat es kommentek nem lehetnek benne! soha semmi egyszerusitett mock placeholder dummy szimulalt fake szart nem engedelyezek es teljes fájl roviditetlen production ready kód nem lehet trancutted nem lehet olyan hogy …és hasonlóan 50 xy nem lehet dummy to do sorry hiányosság minden fájl teljes kódját egyesével fájkba írod semmi mást nem írsz ezen kívűl 
 
-1) A kód jelenleg nem valid repo-struktúra, “összeöntött” fájl — build közben szétesik
+Feladat: a jelenlegi repo (minden fájl a gyökérben: ./) PRODUCTION READY állapotba hozása kompromisszum nélkül.
+Korlátok: a modell és minden modell-változat marad ugyanaz (GLM-4.7-FP8), nincs “könnyítés”, nincs minőségromlás, nincs throughput kompromisszum. Cél: 3000 token/s (hardware-függő, de a szoftver ne legyen szűk keresztmetszet), és elsőre deployolható legyen.
 
-Több helyen látszik, hogy fájl-határoló sorok (pl. ./csrc/kernels.cu, ./csrc/kernels.h) bekerültek a C/CUDA forrásba, ami fordítási hibát okoz, ha ez így egyben van használva.  ￼  ￼
+Kiindulás: a jelenlegi kód a repo rootban (./). Ne feltételezz semmilyen “bi/” vagy más mappa-struktúrát, azt te hozd létre rendezett formában a rootból kiindulva. Ne dobd el a native CUDA utat – erre építs. A jelenlegi HTTPServer prototípust cseréld le production-grade ASGI stackre, és a scheduler/engine integráció legyen valódi continuous batching több párhuzamos kérés között.
 
-2) CPU fallback hamis biztonság: a stub “kernel” lib no-op, ráadásul a stub fájl eleje is sérült
+Kötelező deliverable-ok (mindet implementáld):
 
-A build script CPU módban legyárt egy libkernels.so-t, de a függvények üresek, tehát “lefut”, csak rossz eredményt ad (production-ben vállalhatatlan).  ￼
-A stub-kernel forrás generálásnál pedig a file eleje konkrétan hibás/sérült (h>…), ez simán build break is lehet.  ￼
+1) Production ASGI szerver (FastAPI + uvicorn):
+   - Új modulok/fájlok a rootból szervezetten:
+     - javasolt: ./src/bi_server/ (vagy ./src/server/), de a pontos név mindegy, csak legyen tiszta és csomagolt
+   - Endpointok:
+     - GET /healthz (liveness)
+     - GET /readyz (readiness: model loaded + worker loop fut)
+     - GET /metrics (Prometheus)
+     - POST /v1/completions (OpenAI-kompatibilis, stream és non-stream)
+     - POST /v1/chat/completions (OpenAI-kompatibilis, stream és non-stream)
+   - Streaming: SSE (text/event-stream) delta-k tokenenként.
+   - Request validáció (pydantic), max body size, max prompt tokens, max_new_tokens hard cap, timeout policy.
+   - Konstans és dokumentált response schema, korrekt HTTP status kódok.
 
-3) Terra for ciklusok: tömeges off-by-one / out-of-bounds
+2) Engine architektúra átalakítás (rootból):
+   - Legyen dedikált EngineWorker loop (thread vagy asyncio task), ami folyamatosan hívja az engine.step()-et és kezeli a queue-t.
+   - A request handler nem “tekeri” a decode-ot. Csak enqueue → await Future/stream.
+   - Eredmény visszaadás:
+     - Non-stream: várja a teljes befejezést.
+     - Stream: tokenenként küldje a deltas-t.
+   - Backpressure: max_concurrent_requests + queue limit. Telítésnél 429/503.
 
-Terra-ban a for i = 0, N do inkluzív, tehát N+1 iteráció. A kódban rengeteg helyen “darabszám” változóra fut így → OOB olvasás/írás.
+3) Native API bővítés (ha kell a streaminghez):
+   - Ha a jelenlegi C API csak final outputot ad: egészítsd ki úgy, hogy lehessen rész-tokeneket lekérdezni (pl. get_partial_result) vagy callback/ring-buffer megoldással.
+   - Legyen thread-safe és jól dokumentált a Python wrapperben (ctypes argtypes/restype rendben).
+   - Ne rontsd a teljesítményt: a streaming path ne legyen kötelező overhead non-stream esetben.
 
-Konkrét kritikus példák:
-	•	KV cache init: for i = 0, cache.max_pages do → free_pages[cache.max_pages] OOB.  ￼
-	•	KV oldalak allok/free: for i = 0, num_pages do → túlírja a page_indices-t, és a számlálók is elcsúsznak (többször decrement).  ￼  ￼
-	•	Request token másolás: for i = 0, seq_len do → token_ids[seq_len] OOB.  ￼
-	•	CPU sampling: for i = 0, vocab_size do → OOB a scaled tömbön.  ￼
-	•	Batch decode: for i = 0, bs.num_requests do → OOB request indexelés.  ￼
-	•	run_batch_decode_ext: for i = 0, num_states do → OOB states[i], out_tokens[i].  ￼
-	•	Shard mapping: for i = 0, index.num_shards do és for i = 0, index.num_weights do → OOB map/metadata.  ￼  ￼
-	•	NCCL init / engine free: for i = 0, handle.num_gpus do → OOB context.  ￼  ￼
+4) Konfig és modell betöltés:
+   - A --model-dir alatt olvasd be a config/metát (ha van), és validáld szigorúan (max_seq_len, vocab, rope, fp8 layout).
+   - Hibáknál early-fail, érthető error message.
+   - Egységes CLI flag-ek a root CLI entrypointon:
+     --model-dir, --host, --port, --max-concurrency, --max-batch-tokens, --max-seq-len, --log-level, stb.
 
-4) CPU mód jelenleg crash-re kész, mert a stream-et akkor is dereferálja, ha nincs GPU
+5) Observability:
+   - Structured logging (JSON): request_id, prompt_tokens, gen_tokens, ttft_ms, tps, batch_size átlag, kv_pages.
+   - Prometheus metrikák: request_count, error_count, latency hist, ttft hist, tokens_generated, tps gauge, queue_depth, gpu_mem (ha elérhető).
+   - /readyz csak akkor OK, ha worker loop fut és engine init sikeres volt.
 
-run_prefill és run_decode_step elején: var stream = handle.cuda_contexts[0].stream — ez akkor is lefut, ha use_gpu == 0 és cuda_contexts == nil.  ￼  ￼
-Ez azt jelenti: a “CPU fallback” nemcsak hogy pontatlan (no-op stub), de még segfault-olhat is.
+6) Release/packaging a repo rootban:
+   - Adj ./pyproject.toml-t, és csomagold a Python részt (src layout).
+   - CLI entrypoint: `bi` (vagy `bi-server`), ami tudja: `serve` és `benchmark` (ha van).
+   - Adj ./Dockerfile-t (multi-stage build):
+     - build stage futtatja a meglévő build scriptet (pl. ./scripts/build.sh ha létezik) és lefordítja a native részt
+     - runtime stage minimal, csak runtime függőségek + compiled artifacts
+   - Adj ./README.md-t:
+     - quickstart (build + run serve + curl OpenAI kompat)
+     - tuning tippek (batching, concurrency)
+     - streaming példa curl-lel
 
-5) A Terra engine több ponton láthatóan félbevágott / hiányos
+7) Tesztek:
+   - Unit: API schema, request limit, backpressure, worker loop queue, graceful shutdown.
+   - Mock/Fake engine implementáció a tesztekhez (ne kelljen GPU a CI-hez).
+   - Legalább 1 integration smoke (ha GPU van): serve + 1 completion.
+   - `python -m pytest` fusson CPU-only környezetben.
 
-Több chunk konkrétan sor közepén el van vágva (handle. / handle.max_batch ... handle.), ami fordíthatatlan állapot.  ￼  ￼
+Minőségi elvárások:
+- Nincs TODO/FIXME/placeholder.
+- Nincs busy-wait: használj condition/event alapú jelzést.
+- Graceful shutdown SIGTERM-re (stop accept → drain → exit).
+- Konzisztens kódstílus, típusannotációk a publikus felületen.
+- Dokumentáld az összes új flag-et és endpointot.
 
-⸻
-
-Következő prompt (amit az agentnek adj) — “elsőre production ready” célra
-
-Feladat: a jelenlegi állapotból production-ready, determinisztikusan buildelhető és futtatható kódot csinálsz. NINCS kompromisszum: a model (súlyok/architektúra/kvantizáció) változatlan, a cél throughput továbbra is 3000 tok/s. Nem kérdezel vissza, döntesz és végigviszed.
-
-0) A combined_code 3.txt egy concatenált dump. Először állítsd helyre a repo-fastruktúrát: minden “./path/to/file” fejlécből külön fájlt hozol létre, és a fájlhatároló sorok NEM maradhatnak benne C/CUDA/Terra/Python forrásként. A végeredmény egy normál mappastruktúra legyen (src/terra, csrc, scripts, tests, stb.).
-
-1) Javítsd a Terra off-by-one hibákat TELJES KÖRŰEN.
-   - Terra `for i = 0, N do` inkluzív. Minden olyan ciklust, ahol N darabszám (num_*, *_size, *_len, *_dim, vocab_size, max_pages, num_requests, num_states, num_gpus, num_shards, num_weights stb.), át kell írni `for i = 0, N-1 do` formára.
-   - Kezeld a N==0 esetet biztonságosan (pl. if N==0 then return / skip).
-   - Kiemelten: KV cache init/alloc/free; request token másolás; batch decode; shard mapping; GPU/NCCL context loopok.
-
-2) KV cache correctness:
-   - `init_paged_kv_cache`, `allocate_kv_pages`, `free_kv_pages` számlálói és indexelése legyen invariánsokkal védve (no negative, no OOB).
-   - Adj hozzá olcsó, release-ben kikapcsolható ellenőrzéseket (pl. DEBUG flag), de hot pathban ne rontsa a perfet.
-
-3) CPU mód tisztázása (nem lehet “látszólag működik”):
-   - VAGY: tiltsd le explicit módon (értelmes error/return), és mindenhol kerüld a cuda_contexts dereferálását, ha use_gpu==0.
-   - VAGY: implementálj VALÓDI CPU fallback-et (nem no-op stub).
-   - Bármelyik jó, de production-ben nem lehet silent wrong output / crash.
-   - Minimum: a stream deref csak akkor történhet, ha use_gpu==1 és cuda_contexts != nil.
-
-4) Fordíthatóság:
-   - A csrc/*.h / *.cu / wrapper fájlok legyenek önmagukban fordíthatók (nincs benne fájlhatároló marker sor).
-   - Javítsd a stub_kernels generálást: az include sorok legyenek helyesek, és a stub ne legyen veszélyesen “no-op” ha engedélyezve marad.
-   - Cél: tiszta build (warnings nélkül ideálisan), determinisztikus output.
-
-5) Engine hiányos/truncált részek:
-   - Állítsd helyre a félbevágott Terra kódrészeket (init_cuda_contexts, allocate_inference_buffers, free_engine stb.), hogy teljes és konzisztens legyen.
-
-6) Tesztek / acceptance:
-   - Adj hozzá célzott unit/smoke teszteket az off-by-one és KV cache invariánsokra (N=0, N=1, max_pages, num_requests boundary).
-   - A CI / local parancsok legyenek egyértelműek: `scripts/build.sh` + `pytest` + egy minimál inferencia smoke.
-   - A perfet ne rontsd: debug checkek legyenek kapcsolhatók, és ne kerüljön extra szinkronizáció hot pathba.
-
-Deliverable:
-- Adj patch-szerű kimenetet (fájlok létrehozása/áthelyezése/javítása), plusz egy rövid “How to build + run + test” blokkot.
-- Ne hagyj benne TODO-t, “...” placeholdert, vagy félkész részt.
-
-Ha ezt így ráengeded az agentre, akkor a legnagyobb production-blockerek (repo-szétválasztás, Terra OOB, CPU-mode crash/silent-wrong, truncált engine) egyetlen körben “kényszerítve” lesznek kijavítva.
+Kimenet:
+- Repo-szintű, teljes fájlkészlet változtatás (új fájlokkal együtt).
+- Rövid “how to run” és “how to benchmark” leírás.
