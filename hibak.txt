@@ -1,160 +1,75 @@
-A fő hibák / blokkolók (ami miatt most sem korrekt, sem 3k tok/s nem reális)
+Hibák / miért nem production ready most
 
-1) ./run.py jelenleg csak egy toy szimulátor
-	•	Nem tölti be a Terra engine.so-t, nem használ CUDA-t, nem futtat transzformert.
-	•	tokenize() / detokenize() hamis (ord%1000 + ascii-mókolás) → output értelmetlen.
-	•	step() random logitokat gyárt csak 1000 elemig, miközben vocab_size=151552 → mintavételezés hibás modell-univerzum.
-	•	stop_sequences paraméter nem működik.
+1) A kód jelenleg nem valid repo-struktúra, “összeöntött” fájl — build közben szétesik
 
-➡️ Következmény: amit “tok/s”-nek mér, az nem a modell, hanem Python-loop + random.
+Több helyen látszik, hogy fájl-határoló sorok (pl. ./csrc/kernels.cu, ./csrc/kernels.h) bekerültek a C/CUDA forrásba, ami fordítási hibát okoz, ha ez így egyben van használva.  ￼  ￼
 
-⸻
+2) CPU fallback hamis biztonság: a stub “kernel” lib no-op, ráadásul a stub fájl eleje is sérült
 
-2) A Terra engine.t jelenleg nem csinál valódi GLM forwardot
-	•	run_prefill() csak embedding lookup, nincs attention, nincs KV-cache írás, nincs layer stack, nincs MoE, nincs RMSNorm lánc.
-	•	run_decode_step() gyakorlatilag:
-	•	lekéri a last token embeddinget
-	•	csinál egy lm_head matmult CPU-n
-	•	aztán CPU-n sample-ol
-	•	Ez nem GLM inference, hanem egy minimál “logitgyártó” helyettesítő.
+A build script CPU módban legyárt egy libkernels.so-t, de a függvények üresek, tehát “lefut”, csak rossz eredményt ad (production-ben vállalhatatlan).  ￼
+A stub-kernel forrás generálásnál pedig a file eleje konkrétan hibás/sérült (h>…), ez simán build break is lehet.  ￼
 
-➡️ Következmény: “production ready” nem lehet, mert a modell outputja nem a modell outputja.
+3) Terra for ciklusok: tömeges off-by-one / out-of-bounds
 
-⸻
+Terra-ban a for i = 0, N do inkluzív, tehát N+1 iteráció. A kódban rengeteg helyen “darabszám” változóra fut így → OOB olvasás/írás.
 
-3) Kritikus teljesítmény-gyilkosok a Terra decode útvonalban
-	•	run_decode_step() minden tokenre:
-	•	calloc(vocab_size*sizeof(float)) → ~151552 float → oké még, de…
-	•	FP8 lm_head teljes dequant f32-re minden stepben:
-vocab_size * hidden_dim = 151552*4096 ≈ 620M float ≈ ~2.5 GB tokenenként (!!)
-	•	matmul_cpu() O(vocab*hidden) CPU-n, tokenenként
+Konkrét kritikus példák:
+	•	KV cache init: for i = 0, cache.max_pages do → free_pages[cache.max_pages] OOB.  ￼
+	•	KV oldalak allok/free: for i = 0, num_pages do → túlírja a page_indices-t, és a számlálók is elcsúsznak (többször decrement).  ￼  ￼
+	•	Request token másolás: for i = 0, seq_len do → token_ids[seq_len] OOB.  ￼
+	•	CPU sampling: for i = 0, vocab_size do → OOB a scaled tömbön.  ￼
+	•	Batch decode: for i = 0, bs.num_requests do → OOB request indexelés.  ￼
+	•	run_batch_decode_ext: for i = 0, num_states do → OOB states[i], out_tokens[i].  ￼
+	•	Shard mapping: for i = 0, index.num_shards do és for i = 0, index.num_weights do → OOB map/metadata.  ￼  ￼
+	•	NCCL init / engine free: for i = 0, handle.num_gpus do → OOB context.  ￼  ￼
 
-➡️ Ez még 1 tok/s környékén is megdöglik; 3000 tok/s fizikailag kizárt.
+4) CPU mód jelenleg crash-re kész, mert a stream-et akkor is dereferálja, ha nincs GPU
 
-⸻
+run_prefill és run_decode_step elején: var stream = handle.cuda_contexts[0].stream — ez akkor is lefut, ha use_gpu == 0 és cuda_contexts == nil.  ￼  ￼
+Ez azt jelenti: a “CPU fallback” nemcsak hogy pontatlan (no-op stub), de még segfault-olhat is.
 
-4) API / állapotkezelési bug: RequestState duplikáció + batch leak
-	•	Terra prefill():
-	•	létrehoz egy belső RequestState* state = create_request_state(...)
-	•	add_request_to_batch(handle, state) → batch_state eltárolja a pointert
-	•	majd csak mezőket másol a state_out struktúrába (Python ezt kapja)
-	•	Python bench.py ezután decode_step(handle, byref(state_copy), ...)-t hív.
-	•	Ez a másolat állapotát módosítja, nem a batch-ben tárolt eredetit.
-	•	free_request_state() nem hívja a free_request_state_internal()-t →
-nem adja vissza a KV page-eket, és a batch-ben lévő request sem kerül kiszedésre.
+5) A Terra engine több ponton láthatóan félbevágott / hiányos
 
-➡️ Következmény: memória/KV-page leak, batch_state szemét, inkonzisztens állapot, hosszabb futásnál szétesik.
+Több chunk konkrétan sor közepén el van vágva (handle. / handle.max_batch ... handle.), ami fordíthatatlan állapot.  ￼  ￼
 
 ⸻
 
-5) Safetensors parser: nem biztonságos, nem korrekt
-	•	parse_safetensors_header() a header JSON-t null-terminátor nélkül kezeli strstr-rel → túlolvasás / random match / crash.
-	•	parse_safetensors_index() az entry-számlálás heurisztikus → könnyen rossz.
-	•	Dtype mapping részben oké, de a feldolgozás nem robust.
+Következő prompt (amit az agentnek adj) — “elsőre production ready” célra
 
-➡️ Következmény: weights betöltés megbízhatatlan.
+Feladat: a jelenlegi állapotból production-ready, determinisztikusan buildelhető és futtatható kódot csinálsz. NINCS kompromisszum: a model (súlyok/architektúra/kvantizáció) változatlan, a cél throughput továbbra is 3000 tok/s. Nem kérdezel vissza, döntesz és végigviszed.
 
-⸻
+0) A combined_code 3.txt egy concatenált dump. Először állítsd helyre a repo-fastruktúrát: minden “./path/to/file” fejlécből külön fájlt hozol létre, és a fájlhatároló sorok NEM maradhatnak benne C/CUDA/Terra/Python forrásként. A végeredmény egy normál mappastruktúra legyen (src/terra, csrc, scripts, tests, stb.).
 
-6) KV-cache méretezés hibás / duplázások
-	•	bytes_per_page képlete keveri a “K+V” szorzót és a tényleges elem-bytes-t.
-	•	total_kv_size számítás így könnyen félreallokál (túl kevés / túl sok), ami GPU-n memóriakorrupt, CPU-n pazarlás.
+1) Javítsd a Terra off-by-one hibákat TELJES KÖRŰEN.
+   - Terra `for i = 0, N do` inkluzív. Minden olyan ciklust, ahol N darabszám (num_*, *_size, *_len, *_dim, vocab_size, max_pages, num_requests, num_states, num_gpus, num_shards, num_weights stb.), át kell írni `for i = 0, N-1 do` formára.
+   - Kezeld a N==0 esetet biztonságosan (pl. if N==0 then return / skip).
+   - Kiemelten: KV cache init/alloc/free; request token másolás; batch decode; shard mapping; GPU/NCCL context loopok.
 
-⸻
+2) KV cache correctness:
+   - `init_paged_kv_cache`, `allocate_kv_pages`, `free_kv_pages` számlálói és indexelése legyen invariánsokkal védve (no negative, no OOB).
+   - Adj hozzá olcsó, release-ben kikapcsolható ellenőrzéseket (pl. DEBUG flag), de hot pathban ne rontsa a perfet.
 
-7) Multi-GPU csak “dísz”
-	•	NCCL init csak struktúrákat tölt, nincs ncclCommInitRank, nincs all-reduce/all-gather a compute útvonalban.
-	•	Nincs tensor parallel / expert parallel valós implementáció.
+3) CPU mód tisztázása (nem lehet “látszólag működik”):
+   - VAGY: tiltsd le explicit módon (értelmes error/return), és mindenhol kerüld a cuda_contexts dereferálását, ha use_gpu==0.
+   - VAGY: implementálj VALÓDI CPU fallback-et (nem no-op stub).
+   - Bármelyik jó, de production-ben nem lehet silent wrong output / crash.
+   - Minimum: a stream deref csak akkor történhet, ha use_gpu==1 és cuda_contexts != nil.
 
-⸻
+4) Fordíthatóság:
+   - A csrc/*.h / *.cu / wrapper fájlok legyenek önmagukban fordíthatók (nincs benne fájlhatároló marker sor).
+   - Javítsd a stub_kernels generálást: az include sorok legyenek helyesek, és a stub ne legyen veszélyesen “no-op” ha engedélyezve marad.
+   - Cél: tiszta build (warnings nélkül ideálisan), determinisztikus output.
 
-8) build.sh / CUDA build “oké”-nak tűnik, de productionhoz hiányos
-	•	Nincs arch flag Blackwellre (B200). Modalon ez kritikus lehet.
-	•	A .so-k elkészülnek, de az engine nem biztos, hogy ezeket ténylegesen használja (jelenleg sok kernel csak stub-szinten “deklarált”).
+5) Engine hiányos/truncált részek:
+   - Állítsd helyre a félbevágott Terra kódrészeket (init_cuda_contexts, allocate_inference_buffers, free_engine stb.), hogy teljes és konzisztens legyen.
 
-⸻
+6) Tesztek / acceptance:
+   - Adj hozzá célzott unit/smoke teszteket az off-by-one és KV cache invariánsokra (N=0, N=1, max_pages, num_requests boundary).
+   - A CI / local parancsok legyenek egyértelműek: `scripts/build.sh` + `pytest` + egy minimál inferencia smoke.
+   - A perfet ne rontsd: debug checkek legyenek kapcsolhatók, és ne kerüljön extra szinkronizáció hot pathba.
 
-Következő prompt az agentnek (copy-paste, kompromisszum nélkül, production-ready célra)
+Deliverable:
+- Adj patch-szerű kimenetet (fájlok létrehozása/áthelyezése/javítása), plusz egy rövid “How to build + run + test” blokkot.
+- Ne hagyj benne TODO-t, “...” placeholdert, vagy félkész részt.
 
-FELADAT: A repo-t production-ready GLM-4.7-FP8 inference engine-gé kell tenni úgy, hogy a modell és a minőség NEM változhat, a cél pedig 8x B200-on >= 3000 tok/s (aggregate) folyamatos batchinggel. Nincs kompromisszum: a toy/random logit útvonalakat teljesen ki kell dobni. A deliverable elsőre működjön: ./run.py legyen a fő belépési pont.
-
-0) KÖTELEZŐ ELFOGADÁSI KRITÉRIUMOK
-- ./run.py --smoke: valódi tokenizálás + valódi modell forward (nem random), helyes szöveg dekódolás.
-- ./run.py --bench: mérés és report (tok/s, p50/p99 ms/token, batch size). Modal 8x B200-on el kell érnie a >= 3000 tok/s-t.
-- Nincs per-token óriás-allokáció, nincs per-token full lm_head dequant CPU-ra.
-- Nincs leak (KV page visszaadás, request state életciklus korrekt).
-- Multi-GPU ténylegesen használva (tensor parallel és/vagy expert parallel + NCCL collectives), nem csak “num_gpus” változó.
-
-1) RUN.PY REWRITE (toy kód kidobása)
-- run.py NE tartalmazzon random logits/szimulátor engine-t.
-- run.py töltse be a buildelt engine.so-t ctypes-szel (mint bench.py, de kijavítva).
-- Kötelező módok:
-  - ./run.py --smoke --model ./model --engine ./build/engine.so
-  - ./run.py --bench --duration 60 --concurrency 64 --prompt-len 256 --gen-len 256
-  - ./run.py --serve (egyszerű HTTP JSON API elég: /generate streaming opcionális, de a perf cél miatt ajánlott)
-- Tokenizer: transformers AutoTokenizer kötelező; fallback tilos (nincs ord%1000).
-
-2) TERRA ENGINE API FIX (kritikus)
-- A RequestState NEM lehet “kimásolt struct” a Python oldalon.
-- Vezess be OPAQUE pointer API-t:
-  - prefill(...) -> RequestState* (visszaadott pointer)
-  - decode_step(handle, RequestState*, ...) (ugyanazt a pointert használja)
-  - free_request_state(handle, RequestState*) -> a belső free_request_state_internal-t hívja (KV page free + batch remove)
-- Alternatíva: teljes batch decode C/Terra oldalon:
-  - add_request(handle, ...) -> RequestState*
-  - run_batch_decode(handle, RequestState** states, int n, int64* out_tokens, uint8* out_done)
-  - Python csak schedulerez és egyetlen batch hívást csinál stepenként.
-- BÁRMELYIKET választod: szüntesd meg a jelenlegi “add_request_to_batch + state_out másolat” inkonzisztenciát.
-
-3) SAFETENSORS LOADER ROBUSZTUSSÁ TÉTELE
-- parse_safetensors_header: a header_json-t másold ki egy új bufferbe és null-termináld, mielőtt strstr/parse fut.
-- index parser: ne heurisztikával számolj entry-t; parse-old a JSON-t rendesen (legalább egy minimal JSON parser vagy a safetensors header formátum korrekt feldolgozása).
-- Biztosítsd: tensor offset, dtype, shape 100% helyes.
-
-4) VALÓDI GLM FORWARD IMPLEMENTÁCIÓ (decode + prefill)
-- Implementáld a teljes forward pass-t:
-  - embedding -> (rétegenként) RMSNorm -> QKV proj (FP8 GEMM cublasLt) -> RoPE -> paged attention (KV-cache írás/olvasás) -> o_proj -> residual
-  - MLP/MoE: router + top-k expert, expert GEMM-ek, combine, residual
-  - final norm + lm_head
-- Minden súly GPU memóriában (FP8), per-tensor scale kezelés kötelező.
-- KV-cache GPU-n, page table GPU/CPU szinkron minimális, decode-ben csak szükséges.
-
-5) SAMPLING GPU-N, BATCH-BEN
-- Használd a meglévő kernel interface-eket:
-  - launch_apply_rep_penalty
-  - launch_top_p_sampling
-  - launch_argmax (debug)
-- A sampling batch-ben fusson, és csak a kiválasztott tokenek jöjjenek vissza hostra.
-- Stop tokenek támogatása token-id alapon.
-
-6) MULTI-GPU: TENSOR PARALLEL + NCCL
-- Implementáld legalább a standard TP-t:
-  - lineár rétegek shardolása (column/row parallel), szükséges all-reduce / all-gather NCCL-lel.
-- MoE expert shardolás: experts per GPU, all-to-all/dispatch + combine (ha a modell ezt igényli).
-- NCCL-t ténylegesen initeld (ncwCommInitRank) és használd a wrapper függvényeket.
-
-7) BUILD.SH + MODAL APP PRODUKCIÓSÍTÁS
-- build.sh:
-  - add arch flags B200-hoz (Blackwell), és Release build.
-  - engine.so kerüljön a ./build-be, és LD_LIBRARY_PATH helyesen legyen beállítva.
-- modal_app.py:
-  - build lépések automatikusan fussanak (futhark/terra/cuda wrappers).
-  - benchmark entrypoint: modal run ... -> ugyanazt a --bench reportot adja.
-
-8) TESZTEK / VALIDÁCIÓ (kötelező, “elsőre production-ready” miatt)
-- Smoke teszt: 5 prompt, determinisztikus seed, összehasonlítás Transformers referencia outputtal (legalább a token-id prefix egyezzen N tokenig).
-- Leak teszt: 10k decode step sok requesttel, KV pages visszaáll, RAM/GPU memória nem nő.
-- Perf teszt: reportolja a tok/s-t és a batch statokat.
-
-9) TILALMAK
-- Tilos random logits, toy tokenizer, CPU lm_head dequant per token, per token óriás malloc/calloc.
-- A modell paraméterek/arch NEM változhatnak.
-
-DELIVERABLE: egy PR-szerű változtatáscsomag, amiben:
-- ./run.py a fő belépési pont
-- a Terra engine API kijavítva (opaque state)
-- valós forward + batch decode + GPU sampling
-- Modal deploy + bench működik
-- a bench outputban megvan a >=3000 tok/s cél 8x B200-on.
-
-Ha ezt az agent pontosan végigcsinálja, akkor onnantól tényleg van esélyed a 3k tok/s-re – de jelen állapotban a rendszer még nem “lassú”, hanem nem is ugyanazt a problémát oldja meg (nem futtat GLM-et).
+Ha ezt így ráengeded az agentre, akkor a legnagyobb production-blockerek (repo-szétválasztás, Terra OOB, CPU-mode crash/silent-wrong, truncált engine) egyetlen körben “kényszerítve” lesznek kijavítva.

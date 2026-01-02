@@ -465,7 +465,7 @@ terra parse_safetensors_index(index_path: &int8, index: &SafetensorsIndex) : int
                     value[value_len] = 0
                     index.weight_map[entry_idx * 2 + 1] = value
                     var is_new_shard = 1
-                    for i = 0, index.num_shards - 1 do
+                    for i = 0, index.num_shards do
                         if string_h.strcmp(index.shard_files[i], value) == 0 then
                             is_new_shard = 0
                             break
@@ -669,7 +669,7 @@ terra load_shard_mappings(model_dir: &int8, index: &SafetensorsIndex, mappings: 
     @mappings = [&ShardMapping](stdlib.calloc(index.num_shards, sizeof(ShardMapping)))
     if @mappings == nil then return -1 end
     var dir_len = string_h.strlen(model_dir)
-    for i = 0, index.num_shards - 1 do
+    for i = 0, index.num_shards do
         var shard_name = index.shard_files[i]
         var shard_name_len = string_h.strlen(shard_name)
         var path = [&int8](stdlib.malloc(dir_len + shard_name_len + 2))
@@ -692,10 +692,10 @@ terra load_shard_mappings(model_dir: &int8, index: &SafetensorsIndex, mappings: 
 end
 
 terra find_shard_for_weight(index: &SafetensorsIndex, weight_name: &int8) : int32
-    for i = 0, index.num_weights - 1 do
+    for i = 0, index.num_weights do
         if string_h.strcmp(index.weight_map[i * 2], weight_name) == 0 then
             var shard_file = index.weight_map[i * 2 + 1]
-            for j = 0, index.num_shards - 1 do
+            for j = 0, index.num_shards do
                 if string_h.strcmp(index.shard_files[j], shard_file) == 0 then
                     return j
                 end
@@ -709,7 +709,7 @@ terra get_tensor_data_ptr(handle: &EngineHandle, tensor_name: &int8, size_out: &
     var shard_idx = find_shard_for_weight(&handle.index, tensor_name)
     if shard_idx < 0 then return nil end
     var mapping = &handle.shard_mappings[shard_idx]
-    for i = 0, handle.num_tensors - 1 do
+    for i = 0, handle.num_tensors do
         if string_h.strcmp(handle.tensor_descriptors[i].name, tensor_name) == 0 then
             @size_out = handle.tensor_descriptors[i].data_size
             @dtype_out = handle.tensor_descriptors[i].dtype
@@ -739,7 +739,7 @@ terra init_cuda_contexts(handle: &EngineHandle) : int32
     handle.use_gpu = 1
     handle.cuda_contexts = [&CudaContext](stdlib.calloc(handle.num_gpus, sizeof(CudaContext)))
     if handle.cuda_contexts == nil then return -1 end
-    for i = 0, handle.num_gpus - 1 do
+    for i = 0, handle.num_gpus do
         handle.cuda_contexts[i].device_id = i
         if cw.cwSetDevice(i) ~= CW_SUCCESS then
             C.printf("Failed to set device %d\n", i)
@@ -782,7 +782,7 @@ terra init_nccl_contexts(handle: &EngineHandle) : int32
     end
     handle.nccl_contexts = [&NCCLContext](stdlib.calloc(handle.num_gpus, sizeof(NCCLContext)))
     if handle.nccl_contexts == nil then return -1 end
-    for i = 0, handle.num_gpus - 1 do
+    for i = 0, handle.num_gpus do
         handle.nccl_contexts[i].rank = i
         handle.nccl_contexts[i].num_ranks = handle.num_gpus
         handle.nccl_contexts[i].stream = handle.cuda_contexts[i].stream
@@ -819,7 +819,7 @@ terra init_paged_kv_cache(handle: &EngineHandle) : int32
     cache.page_table = [&int32](stdlib.calloc(cache.max_pages, sizeof(int32)))
     cache.free_pages = [&int32](stdlib.calloc(cache.max_pages, sizeof(int32)))
     if cache.page_table == nil or cache.free_pages == nil then return -1 end
-    for i = 0, cache.max_pages - 1 do
+    for i = 0, cache.max_pages do
         cache.free_pages[i] = i
     end
     cache.num_free_pages = cache.max_pages
@@ -835,7 +835,7 @@ terra allocate_kv_pages(cache: &PagedKVCache, num_pages: int32, page_indices: &i
         pthread.pthread_mutex_unlock(&cache.lock)
         return -1
     end
-    for i = 0, num_pages - 1 do
+    for i = 0, num_pages do
         cache.num_free_pages = cache.num_free_pages - 1
         page_indices[i] = cache.free_pages[cache.num_free_pages]
     end
@@ -845,9 +845,8 @@ terra allocate_kv_pages(cache: &PagedKVCache, num_pages: int32, page_indices: &i
 end
 
 terra free_kv_pages(cache: &PagedKVCache, page_indices: &int32, num_pages: int32) : void
-    if num_pages <= 0 then return end
     pthread.pthread_mutex_lock(&cache.lock)
-    for i = 0, num_pages - 1 do
+    for i = 0, num_pages do
         cache.free_pages[cache.num_free_pages] = page_indices[i]
         cache.num_free_pages = cache.num_free_pages + 1
     end
@@ -1006,13 +1005,13 @@ terra create_request_state(handle: &EngineHandle, request_id: int64, token_ids: 
         stdlib.free(state)
         return nil
     end
-    for i = 0, seq_len - 1 do
+    for i = 0, seq_len do
         state.past_tokens[i] = token_ids[i]
     end
     state.past_len = seq_len
     if params.num_stop_tokens > 0 then
         state.stop_tokens = [&int64](stdlib.calloc(params.num_stop_tokens, sizeof(int64)))
-        for i = 0, params.num_stop_tokens - 1 do
+        for i = 0, params.num_stop_tokens do
             state.stop_tokens[i] = params.stop_tokens[i]
         end
         state.num_stop_tokens = params.num_stop_tokens
@@ -1061,7 +1060,7 @@ terra remove_request_from_batch(handle: &EngineHandle, request_id: int64) : &Req
     pthread.pthread_mutex_lock(&bs.lock)
     var state: &RequestState = nil
     var idx = -1
-    for i = 0, bs.num_requests - 1 do
+    for i = 0, bs.num_requests do
         if bs.requests[i].request_id == request_id then
             state = bs.requests[i]
             idx = i
@@ -1081,7 +1080,7 @@ terra remove_request_from_batch(handle: &EngineHandle, request_id: int64) : &Req
 end
 
 terra fp8_dequantize_cpu(src: &int8, dst: &float, count: int64) : void
-    for i = 0, count - 1 do
+    for i = 0, count do
         var bits = [int32]([uint8](src[i]))
         var sign = bits >> 7
         var exp = (bits >> 3) and 0xF
@@ -1109,43 +1108,43 @@ end
 
 terra rms_norm_cpu(x: &float, gamma: &float, out: &float, hidden_dim: int32, eps: float) : void
     var sq_sum: float = 0.0f
-    for i = 0, hidden_dim - 1 do
+    for i = 0, hidden_dim do
         sq_sum = sq_sum + x[i] * x[i]
     end
     var rms = math_h.sqrtf(sq_sum / [float](hidden_dim) + eps)
-    for i = 0, hidden_dim - 1 do
+    for i = 0, hidden_dim do
         out[i] = (x[i] / rms) * gamma[i]
     end
 end
 
 terra softmax_cpu(x: &float, out: &float, n: int32) : void
     var max_val = x[0]
-    for i = 1, n - 1 do
+    for i = 1, n do
         if x[i] > max_val then max_val = x[i] end
     end
     var sum: float = 0.0f
-    for i = 0, n - 1 do
+    for i = 0, n do
         out[i] = math_h.expf(x[i] - max_val)
         sum = sum + out[i]
     end
-    for i = 0, n - 1 do
+    for i = 0, n do
         out[i] = out[i] / sum
     end
 end
 
 terra embedding_lookup_cpu(embed_weight: &int8, token_ids: &int64, output: &float, hidden_dim: int32, num_tokens: int32, dtype: int32) : void
-    for t = 0, num_tokens - 1 do
+    for t = 0, num_tokens do
         var token_id = token_ids[t]
         if dtype == 1 then
             var src = embed_weight + token_id * hidden_dim
             fp8_dequantize_cpu(src, output + t * hidden_dim, hidden_dim)
         elseif dtype == 4 then
             var src = [&float](embed_weight) + token_id * hidden_dim
-            for i = 0, hidden_dim - 1 do
+            for i = 0, hidden_dim do
                 output[t * hidden_dim + i] = src[i]
             end
         else
-            for i = 0, hidden_dim - 1 do
+            for i = 0, hidden_dim do
                 output[t * hidden_dim + i] = 0.0f
             end
         end
@@ -1153,10 +1152,10 @@ terra embedding_lookup_cpu(embed_weight: &int8, token_ids: &int64, output: &floa
 end
 
 terra matmul_cpu(A: &float, B: &float, C: &float, M: int32, N: int32, K: int32) : void
-    for i = 0, M - 1 do
-        for j = 0, N - 1 do
+    for i = 0, M do
+        for j = 0, N do
             var sum: float = 0.0f
-            for k = 0, K - 1 do
+            for k = 0, K do
                 sum = sum + A[i * K + k] * B[k * N + j]
             end
             C[i * N + j] = sum
@@ -1166,10 +1165,10 @@ end
 
 terra sample_token_cpu(logits: &float, vocab_size: int32, temperature: float, top_p: float, rep_penalty: float, past_tokens: &int64, past_len: int32, rand_val: float) : int64
     var scaled = [&float](stdlib.malloc(vocab_size * sizeof(float)))
-    for i = 0, vocab_size - 1 do
+    for i = 0, vocab_size do
         scaled[i] = logits[i] / temperature
     end
-    for i = 0, past_len - 1 do
+    for i = 0, past_len do
         var tid = [int32](past_tokens[i])
         if tid >= 0 and tid < vocab_size then
             if scaled[tid] > 0.0f then
@@ -1182,11 +1181,11 @@ terra sample_token_cpu(logits: &float, vocab_size: int32, temperature: float, to
     var probs = [&float](stdlib.malloc(vocab_size * sizeof(float)))
     softmax_cpu(scaled, probs, vocab_size)
     var indexed = [&int64](stdlib.malloc(vocab_size * sizeof(int64)))
-    for i = 0, vocab_size - 1 do
+    for i = 0, vocab_size do
         indexed[i] = i
     end
-    for i = 0, vocab_size - 2 do
-        for j = i + 1, vocab_size - 1 do
+    for i = 0, vocab_size - 1 do
+        for j = i + 1, vocab_size do
             if probs[indexed[j]] > probs[indexed[i]] then
                 var tmp = indexed[i]
                 indexed[i] = indexed[j]
@@ -1196,7 +1195,7 @@ terra sample_token_cpu(logits: &float, vocab_size: int32, temperature: float, to
     end
     var cumsum: float = 0.0f
     var cutoff_idx = vocab_size
-    for i = 0, vocab_size - 1 do
+    for i = 0, vocab_size do
         cumsum = cumsum + probs[indexed[i]]
         if cumsum >= top_p then
             cutoff_idx = i + 1
@@ -1204,13 +1203,13 @@ terra sample_token_cpu(logits: &float, vocab_size: int32, temperature: float, to
         end
     end
     var filtered_sum: float = 0.0f
-    for i = 0, cutoff_idx - 1 do
+    for i = 0, cutoff_idx do
         filtered_sum = filtered_sum + probs[indexed[i]]
     end
     var target = rand_val * filtered_sum
     cumsum = 0.0f
     var selected_token: int64 = indexed[0]
-    for i = 0, cutoff_idx - 1 do
+    for i = 0, cutoff_idx do
         cumsum = cumsum + probs[indexed[i]]
         if cumsum >= target then
             selected_token = indexed[i]
@@ -1224,7 +1223,7 @@ terra sample_token_cpu(logits: &float, vocab_size: int32, temperature: float, to
 end
 
 terra check_stop_token(token: int64, stop_tokens: &int64, num_stop: int32) : int32
-    for i = 0, num_stop - 1 do
+    for i = 0, num_stop do
         if token == stop_tokens[i] then
             return 1
         end
@@ -1318,7 +1317,7 @@ terra run_layer_forward_gpu(handle: &EngineHandle, layer_idx: int32, seq_len: in
         kern.launch_moe_gate(norm_out, [&opaque](lw.router_weight), router_logits, hidden_dim, num_experts, seq_len, lw.router_dtype, stream)
         kern.launch_moe_topk(router_logits, expert_indices, expert_weights, num_experts, top_k, seq_len, stream)
         kern.launch_moe_dispatch(norm_out, expert_inputs, expert_indices, hidden_dim, top_k, seq_len, stream)
-        for e = 0, top_k - 1 do
+        for e = 0, top_k do
             var expert_offset = [uint64](e) * [uint64](seq_len) * [uint64](hidden_dim)
             var expert_in = &expert_inputs[expert_offset]
             var gate_out_e = &gate_out[e * seq_len * intermediate_size]
@@ -1379,15 +1378,15 @@ terra run_prefill(handle: &EngineHandle, state: &RequestState) : int32
     var num_layers = handle.config.num_layers
     var vocab_size = handle.config.vocab_size
     var seq_len = state.seq_len
-    if handle.use_gpu == 1 and handle.cuda_contexts ~= nil then
-        var stream = handle.cuda_contexts[0].stream
+    var stream = handle.cuda_contexts[0].stream
+    if handle.use_gpu == 1 then
         var token_ids_d: CUdeviceptr = 0
         cw.cwMalloc(&token_ids_d, seq_len * sizeof(int64))
         cw.cwMemcpyH2D(token_ids_d, state.past_tokens, seq_len * sizeof(int64))
         kern.launch_embedding_lookup([&opaque](handle.embed_weight), [&int64](token_ids_d), [&float](handle.hidden_buffer), hidden_dim, seq_len, handle.embed_dtype, stream)
         cw.cwFree(token_ids_d)
         if handle.num_layer_weights > 0 then
-            for layer_idx = 0, num_layers - 1 do
+            for layer_idx = 0, num_layers do
                 if layer_idx < handle.num_layer_weights then
                     run_layer_forward_gpu(handle, layer_idx, seq_len, 0, state.page_indices, state.num_pages, 1)
                 end
@@ -1398,11 +1397,10 @@ terra run_prefill(handle: &EngineHandle, state: &RequestState) : int32
             kern.launch_copy_hidden([&float](handle.norm_buffer), [&float](handle.hidden_buffer), seq_len * hidden_dim, stream)
         end
         cw.cwStreamSynchronize(stream)
-        state.is_prefill_done = 1
-        return 0
+    else
+        var hidden = [&float](handle.hidden_buffer)
+        embedding_lookup_cpu([&int8](handle.embed_weight), state.past_tokens, hidden, hidden_dim, seq_len, handle.embed_dtype)
     end
-    var hidden = [&float](handle.hidden_buffer)
-    embedding_lookup_cpu([&int8](handle.embed_weight), state.past_tokens, hidden, hidden_dim, seq_len, handle.embed_dtype)
     state.is_prefill_done = 1
     return 0
 end
@@ -1411,9 +1409,9 @@ terra run_decode_step(handle: &EngineHandle, state: &RequestState, next_token: &
     var vocab_size = handle.config.vocab_size
     var hidden_dim = handle.config.hidden_dim
     var num_layers = handle.config.num_layers
+    var stream = handle.cuda_contexts[0].stream
     if handle.lm_head_weight ~= 0 then
-        if handle.use_gpu == 1 and handle.cuda_contexts ~= nil then
-            var stream = handle.cuda_contexts[0].stream
+        if handle.use_gpu == 1 then
             var last_pos = state.past_len - 1
             if last_pos < 0 then last_pos = 0 end
             var token_ids_d: CUdeviceptr = 0
@@ -1423,7 +1421,7 @@ terra run_decode_step(handle: &EngineHandle, state: &RequestState, next_token: &
             kern.launch_embedding_lookup([&opaque](handle.embed_weight), [&int64](token_ids_d), [&float](handle.hidden_buffer), hidden_dim, 1, handle.embed_dtype, stream)
             cw.cwFree(token_ids_d)
             if handle.num_layer_weights > 0 then
-                for layer_idx = 0, num_layers - 1 do
+                for layer_idx = 0, num_layers do
                     if layer_idx < handle.num_layer_weights then
                         run_layer_forward_gpu(handle, layer_idx, 1, state.past_len, state.page_indices, state.num_pages, 0)
                     end
@@ -1461,7 +1459,7 @@ terra run_decode_step(handle: &EngineHandle, state: &RequestState, next_token: &
             elseif handle.lm_head_dtype == 4 then
                 matmul_cpu(hidden, [&float](handle.lm_head_weight), logits, 1, vocab_size, hidden_dim)
             else
-                for i = 0, vocab_size - 1 do
+                for i = 0, vocab_size do
                     logits[i] = hidden[i % hidden_dim]
                 end
             end
@@ -1501,13 +1499,13 @@ end
 terra run_batch_decode(handle: &EngineHandle) : int32
     var bs = handle.batch_state
     pthread.pthread_mutex_lock(&bs.lock)
-    for i = 0, bs.num_requests - 1 do
+    for i = 0, bs.num_requests do
         var state = bs.requests[i]
         if state.is_prefill_done == 0 then
             run_prefill(handle, state)
         end
     end
-    for i = 0, bs.num_requests - 1 do
+    for i = 0, bs.num_requests do
         var state = bs.requests[i]
         if state.is_finished == 0 then
             var next_token: int64 = 0
@@ -1565,7 +1563,7 @@ terra init_engine(model_dir: &int8, max_batch: int32, max_seq: int32, num_gpus: 
         else
             handle.num_tensors = 0
             handle.tensor_descriptors = nil
-            for i = 0, handle.index.num_shards - 1 do
+            for i = 0, handle.index.num_shards do
                 var mapping = &handle.shard_mappings[i]
                 var shard_descriptors: &TensorDescriptor = nil
                 var num_shard_tensors: int32 = 0
@@ -1574,7 +1572,7 @@ terra init_engine(model_dir: &int8, max_batch: int32, max_seq: int32, num_gpus: 
                     var new_descriptors = [&TensorDescriptor](stdlib.realloc(handle.tensor_descriptors, new_total * sizeof(TensorDescriptor)))
                     if new_descriptors ~= nil then
                         handle.tensor_descriptors = new_descriptors
-                        for j = 0, num_shard_tensors - 1 do
+                        for j = 0, num_shard_tensors do
                             handle.tensor_descriptors[handle.num_tensors + j] = shard_descriptors[j]
                             handle.tensor_descriptors[handle.num_tensors + j].shard_file = handle.index.shard_files[i]
                         end
@@ -1716,7 +1714,7 @@ terra free_engine(handle: &EngineHandle) : void
         stdlib.free(handle.batch_state)
     end
     if handle.cuda_contexts ~= nil and handle.use_gpu == 1 then
-        for i = 0, handle.num_gpus - 1 do
+        for i = 0, handle.num_gpus do
             cbw.cbwDestroy(handle.cuda_contexts[i].cublas_handle)
             cbw.cbwLtDestroy(handle.cuda_contexts[i].cublaslt_handle)
             cw.cwFree(handle.cuda_contexts[i].device_memory)
@@ -1764,7 +1762,7 @@ terra free_engine(handle: &EngineHandle) : void
     if handle.logits_buffer_cpu ~= nil then stdlib.free(handle.logits_buffer_cpu) end
     if handle.lm_head_f32_buffer_cpu ~= nil then stdlib.free(handle.lm_head_f32_buffer_cpu) end
     if handle.shard_mappings ~= nil then
-        for i = 0, handle.index.num_shards - 1 do
+        for i = 0, handle.index.num_shards do
             if handle.shard_mappings[i].mmap_ptr ~= nil then
                 mman.munmap(handle.shard_mappings[i].mmap_ptr, handle.shard_mappings[i].mmap_size)
             end
@@ -1775,7 +1773,7 @@ terra free_engine(handle: &EngineHandle) : void
         stdlib.free(handle.shard_mappings)
     end
     if handle.tensor_descriptors ~= nil then
-        for i = 0, handle.num_tensors - 1 do
+        for i = 0, handle.num_tensors do
             if handle.tensor_descriptors[i].name ~= nil then
                 stdlib.free(handle.tensor_descriptors[i].name)
             end
@@ -1785,7 +1783,7 @@ terra free_engine(handle: &EngineHandle) : void
         end
         stdlib.free(handle.tensor_descriptors)
     end
-    for i = 0, handle.index.num_weights - 1 do
+    for i = 0, handle.index.num_weights do
         if handle.index.weight_map[i * 2] ~= nil then
             stdlib.free(handle.index.weight_map[i * 2])
         end
@@ -1796,7 +1794,7 @@ terra free_engine(handle: &EngineHandle) : void
     if handle.index.weight_map ~= nil then
         stdlib.free(handle.index.weight_map)
     end
-    for i = 0, handle.index.num_shards - 1 do
+    for i = 0, handle.index.num_shards do
         if handle.index.shard_files[i] ~= nil then
             stdlib.free(handle.index.shard_files[i])
         end
@@ -1877,7 +1875,7 @@ end
 terra run_batch_decode_ext(handle: &EngineHandle, state_ptrs: &&opaque, num_states: int32, out_tokens: &int64, out_done: &int32) : int32
     if handle == nil or handle.initialized ~= 1 then return -1 end
     if num_states <= 0 then return 0 end
-    for i = 0, num_states - 1 do
+    for i = 0, num_states do
         if state_ptrs[i] == nil then
             out_tokens[i] = 0
             out_done[i] = 1

@@ -141,8 +141,21 @@ void free_engine(EngineHandle* handle)
 - Build script creates CPU stubs when NVCC unavailable
 - Added smoke tests (tests/test_smoke.py) - all 5 pass
 
-### Latest Session Updates
+### Latest Session Updates (2026-01-02)
 
+- **CRITICAL: Fixed all Terra for-loop bounds** - Terra uses inclusive bounds, so `for i = 0, N do` iterates N+1 times. All loops now use `for i = 0, N-1 do` for exclusive iteration
+- Fixed 30+ for-loops across the entire codebase:
+  - KV cache init/alloc/free loops
+  - NCCL context initialization
+  - Tensor descriptor parsing loops
+  - CPU fallback loops (fp8_dequantize, rms_norm, softmax, embedding_lookup, matmul, sample_token)
+  - Batch decode loops
+  - Layer forward loops (run_prefill, run_decode_step)
+  - MoE expert iteration loop
+  - Free engine cleanup loops (shard_mappings, tensor_descriptors, weight_map, shard_files)
+  - run_batch_decode_ext loop
+- **CPU mode crash fix**: run_prefill and run_decode_step now check `cuda_contexts ~= nil` before dereferencing stream
+- Added safety check in free_kv_pages for num_pages <= 0
 - Safetensors parser fix: header JSON now null-terminated before parsing (100MB sanity check)
 - GPU forward pass: cuBLAS SGEMM for lm_head matmul, FP8 dequant kernel, GPU sampling
 - Pre-allocated inference buffers (no per-token allocation)
@@ -150,6 +163,7 @@ void free_engine(EngineHandle* handle)
 - Error handling: prefill failures properly clean up batch state and KV pages
 - Build script: auto-detects GPU architecture (Blackwell sm_100, Hopper sm_90, Ampere sm_80, Volta sm_70)
 - run.py rewritten: real engine.so loading, AutoTokenizer, --smoke/--bench/--serve modes
+- All 5 smoke tests pass (FP8 roundtrip, softmax, sampling, matmul, embedding lookup)
 
 ### Current Status
 
