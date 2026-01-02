@@ -951,6 +951,7 @@ def validate_build() -> Dict[str, Any]:
         "cuda_available": False,
         "nccl_available": False,
         "engine_loads": False,
+        "is_stub_build": False,
         "errors": []
     }
     try:
@@ -974,12 +975,38 @@ def validate_build() -> Dict[str, Any]:
                 result["has_decode_step"] = True
         except Exception as e:
             result["errors"].append(f"engine.so load failed: {e}")
+    cuda_wrapper = "/build/libcudawrap.so"
+    if os.path.exists(cuda_wrapper):
+        try:
+            cuda = ctypes.CDLL(cuda_wrapper)
+            cuda.cwGetErrorString.argtypes = [ctypes.c_int]
+            cuda.cwGetErrorString.restype = ctypes.c_char_p
+            error_msg = cuda.cwGetErrorString(999)
+            if error_msg:
+                error_str = error_msg.decode('utf-8', errors='ignore')
+                if "stub" in error_str.lower() or "CPU" in error_str:
+                    result["is_stub_build"] = True
+                    result["errors"].append("CRITICAL: libcudawrap.so is a CPU stub, not real GPU code")
+        except Exception as e:
+            result["errors"].append(f"CUDA wrapper validation failed: {e}")
+    kernel_lib = "/build/libkernels.so"
+    if os.path.exists(kernel_lib):
+        try:
+            with open(kernel_lib, 'rb') as f:
+                content = f.read(2048)
+            if b"GPU kernel stub called" in content or b"ERROR: GPU kernel stub" in content:
+                result["is_stub_build"] = True
+                result["errors"].append("CRITICAL: libkernels.so is a CPU stub, will abort on kernel calls")
+        except Exception as e:
+            result["errors"].append(f"Kernel library validation failed: {e}")
     try:
         nccl_check = subprocess.run(["ls", "/usr/lib/x86_64-linux-gnu/libnccl*"], capture_output=True, text=True, shell=True)
         if "libnccl" in nccl_check.stdout:
             result["nccl_available"] = True
     except Exception:
         pass
+    if result["is_stub_build"]:
+        result["errors"].append("BUILD VALIDATION FAILED: Stub libraries detected. This build is NOT production-ready.")
     return result
 
 @app.function(

@@ -1,73 +1,71 @@
-ne írj semmi mást csak a teljes fájlokat es kommentek nem lehetnek benne! soha semmi egyszerusitett mock placeholder dummy szimulalt fake szart nem engedelyezek es teljes fájl roviditetlen production ready kód nem lehet trancutted nem lehet olyan hogy …és hasonlóan 50 xy nem lehet dummy to do sorry hiányosság minden fájl teljes kódját egyesével fájkba írod semmi mást nem írsz ezen kívűl 
+Ami most biztosan nem production ready (blokkoló hibák)
 
-Feladat: a jelenlegi repo (minden fájl a gyökérben: ./) PRODUCTION READY állapotba hozása kompromisszum nélkül.
-Korlátok: a modell és minden modell-változat marad ugyanaz (GLM-4.7-FP8), nincs “könnyítés”, nincs minőségromlás, nincs throughput kompromisszum. Cél: 3000 token/s (hardware-függő, de a szoftver ne legyen szűk keresztmetszet), és elsőre deployolható legyen.
+1) A build script rossz helyről keresi a forrásokat (path mismatch)
 
-Kiindulás: a jelenlegi kód a repo rootban (./). Ne feltételezz semmilyen “bi/” vagy más mappa-struktúrát, azt te hozd létre rendezett formában a rootból kiindulva. Ne dobd el a native CUDA utat – erre építs. A jelenlegi HTTPServer prototípust cseréld le production-grade ASGI stackre, és a scheduler/engine integráció legyen valódi continuous batching több párhuzamos kérés között.
+A scripts/build.sh a Terra és Futhark forrásokat a csrc/ alól keresi (${SRC_DIR}), miközben a repo-ban ezek src/terra/... és src/futhark/... alatt vannak. Emiatt a build alapból kihagyhatja az engine buildet és/vagy a Futhark részt.  ￼  ￼  ￼
 
-Kötelező deliverable-ok (mindet implementáld):
+2) A Docker builder image NEM telepít Terrát (és nagy eséllyel Futhark-ot sem)
 
-1) Production ASGI szerver (FastAPI + uvicorn):
-   - Új modulok/fájlok a rootból szervezetten:
-     - javasolt: ./src/bi_server/ (vagy ./src/server/), de a pontos név mindegy, csak legyen tiszta és csomagolt
-   - Endpointok:
-     - GET /healthz (liveness)
-     - GET /readyz (readiness: model loaded + worker loop fut)
-     - GET /metrics (Prometheus)
-     - POST /v1/completions (OpenAI-kompatibilis, stream és non-stream)
-     - POST /v1/chat/completions (OpenAI-kompatibilis, stream és non-stream)
-   - Streaming: SSE (text/event-stream) delta-k tokenenként.
-   - Request validáció (pydantic), max body size, max prompt tokens, max_new_tokens hard cap, timeout policy.
-   - Konstans és dokumentált response schema, korrekt HTTP status kódok.
+A Dockerfile builder szakaszában nincs Terra telepítés (és Futhark sincs), miközben a build script ezeket feltételesen hívja. Így engine.so könnyen nem készül el, vagy “skip”-elődik.  ￼  ￼
 
-2) Engine architektúra átalakítás (rootból):
-   - Legyen dedikált EngineWorker loop (thread vagy asyncio task), ami folyamatosan hívja az engine.step()-et és kezeli a queue-t.
-   - A request handler nem “tekeri” a decode-ot. Csak enqueue → await Future/stream.
-   - Eredmény visszaadás:
-     - Non-stream: várja a teljes befejezést.
-     - Stream: tokenenként küldje a deltas-t.
-   - Backpressure: max_concurrent_requests + queue limit. Telítésnél 429/503.
+3) A build “túl engedékeny”: hiba esetén továbbmegy
 
-3) Native API bővítés (ha kell a streaminghez):
-   - Ha a jelenlegi C API csak final outputot ad: egészítsd ki úgy, hogy lehessen rész-tokeneket lekérdezni (pl. get_partial_result) vagy callback/ring-buffer megoldással.
-   - Legyen thread-safe és jól dokumentált a Python wrapperben (ctypes argtypes/restype rendben).
-   - Ne rontsd a teljesítményt: a streaming path ne legyen kötelező overhead non-stream esetben.
+A script több helyen nem fail-fast módon viselkedik (pl. “Terra not found, skipping…”, “Futhark compile skipped…”), ami production-ben veszélyes: lehet olyan image, ami sikeresen buildel, de valójában nincs GPU-engine.  ￼
 
-4) Konfig és modell betöltés:
-   - A --model-dir alatt olvasd be a config/metát (ha van), és validáld szigorúan (max_seq_len, vocab, rope, fp8 layout).
-   - Hibáknál early-fail, érthető error message.
-   - Egységes CLI flag-ek a root CLI entrypointon:
-     --model-dir, --host, --port, --max-concurrency, --max-batch-tokens, --max-seq-len, --log-level, stb.
+4) CPU stubok “sikerrel” térnek vissza → csendes hibás működés
 
-5) Observability:
-   - Structured logging (JSON): request_id, prompt_tokens, gen_tokens, ttft_ms, tps, batch_size átlag, kv_pages.
-   - Prometheus metrikák: request_count, error_count, latency hist, ttft hist, tokens_generated, tps gauge, queue_depth, gpu_mem (ha elérhető).
-   - /readyz csak akkor OK, ha worker loop fut és engine init sikeres volt.
+A stub megoldás úgy van felépítve, hogy egy csomó cuBLAS / kernel call 0-val (sikerrel) tér vissza, de nem csinál semmit. Ez production-ben halál: ha véletlen a stub ágon fut, látszólag működik, csak rossz outputtal / null műveletekkel.  ￼
 
-6) Release/packaging a repo rootban:
-   - Adj ./pyproject.toml-t, és csomagold a Python részt (src layout).
-   - CLI entrypoint: `bi` (vagy `bi-server`), ami tudja: `serve` és `benchmark` (ha van).
-   - Adj ./Dockerfile-t (multi-stage build):
-     - build stage futtatja a meglévő build scriptet (pl. ./scripts/build.sh ha létezik) és lefordítja a native részt
-     - runtime stage minimal, csak runtime függőségek + compiled artifacts
-   - Adj ./README.md-t:
-     - quickstart (build + run serve + curl OpenAI kompat)
-     - tuning tippek (batching, concurrency)
-     - streaming példa curl-lel
+5) Runtime linker kockázat: engine.so + függő .so-k betöltése
 
-7) Tesztek:
-   - Unit: API schema, request limit, backpressure, worker loop queue, graceful shutdown.
-   - Mock/Fake engine implementáció a tesztekhez (ne kelljen GPU a CI-hez).
-   - Legalább 1 integration smoke (ha GPU van): serve + 1 completion.
-   - `python -m pytest` fusson CPU-only környezetben.
+A runtime image-ben az ENGINE_PATH=/app/build/engine.so, és a build is a build/ alá rakja a .so-kat. Viszont nincs explicit garancia (RPATH $ORIGIN vagy LD_LIBRARY_PATH a runtime stage-ben), hogy az engine.so mindig megtalálja a libcudawrap.so / libcublaswrap.so / libncclwrap.so / libkernels.so függőségeit. (A Terra oldalon sima névvel vannak linkelve.)  ￼  ￼
 
-Minőségi elvárások:
-- Nincs TODO/FIXME/placeholder.
-- Nincs busy-wait: használj condition/event alapú jelzést.
-- Graceful shutdown SIGTERM-re (stop accept → drain → exit).
-- Konzisztens kódstílus, típusannotációk a publikus felületen.
-- Dokumentáld az összes új flag-et és endpointot.
+⸻
 
-Kimenet:
-- Repo-szintű, teljes fájlkészlet változtatás (új fájlokkal együtt).
-- Rövid “how to run” és “how to benchmark” leírás.
+Következő prompt az agentnek (copy-paste)
+
+Feladat: a jelenlegi repo-t ELSŐ PRÓBÁRA production ready állapotba hozni. NINCS kompromisszum: ugyanaz a modell, ugyanaz a runtime viselkedés és a 3000 tok/s cél érintetlen. Csak build/deploy/robosztusság javítás.
+
+Környezeti feltételezés: a fájlok valódi helye a repo gyökérből indul (./), nem “bi/”.
+Cél: egyetlen, konzisztens build pipeline, ami GPU-n engine.so-t és a szükséges .so-kat legyártja, és runtime-ban biztosan betölthető.
+
+1) PATH KONZISZTENCIA (blokkoló)
+- Javítsd a scripts/build.sh-ben a forrás-útvonalakat:
+  - Terra forrás: ./src/terra/engine.t (ne ./csrc/terra/engine.t)
+  - Futhark forrás: ./src/futhark/kernels.fut (ne ./csrc/futhark/kernels.fut)
+  - A CUDA/C++ kód maradjon ./csrc/... alatt.
+- A build végén az összes runtime-hoz szükséges .so kerüljön a ./build/ könyvtárba:
+  - engine.so
+  - libcudawrap.so, libcublaswrap.so, libncclwrap.so, libkernels.so
+- A build.sh legyen fail-fast: ha engine.so nem készül el GPU build módban, EXIT 1.
+
+2) DEPENDENCIÁK A DOCKER BUILDER-BEN (blokkoló)
+- A Dockerfile builder stage-ben telepítsd Terrát (és ha kell, Futhark-ot).
+  - Terra: pin-elt verzió, reproducible letöltés (pl. release tarball) + PATH.
+  - Futhark: ha ténylegesen kell, pin-elt install; ha nem kell runtime-hoz, akkor tedd opcionálissá úgy, hogy a build ne “csendben” hagyja ki, hanem egyértelmű logot adjon.
+- A Docker build akkor legyen sikeres, ha engine.so ténylegesen elkészült.
+
+3) RUNTIME DYNAMIC LINKER GARANCIA (blokkoló)
+- Biztosítsd, hogy az engine.so runtime-ban mindig megtalálja a build/ mappában lévő függő .so-kat:
+  - Preferált: rpath=$ORIGIN beállítás az engine.so linkelésekor (Terra buildnél), hogy az engine.so a saját könyvtárából töltsön.
+  - Alternatíva: runtime Dockerfile stage-ben állítsd be LD_LIBRARY_PATH=/app/build (de rpath az elsődleges).
+- Adj hozzá egy minimál smoke tesztet a container indulásakor vagy CI-ben, ami:
+  - betölti az engine.so-t
+  - lefuttat egy trivialis initet és egy nagyon rövid generálást (akár 1 token) és ellenőrzi, hogy nem stub ág fut.
+
+4) CPU STUBOK: PRODUCTION-BEN TILOS A “CSENDES SIKER”
+- Alapértelmezett viselkedés: ha nincs NVCC/GPU, a build FAIL-eljen (EXIT 1).
+- Ha kell fejlesztői mód, azt explicit flaggel engedd: ALLOW_CPU=1.
+- A stub implementációk ne térjenek vissza “success=0”-val olyan hívásoknál, amik nélkül nincs korrekt működés (különösen cuBLAS/kernels). Inkább adjanak vissza egyértelmű hibakódot, amit a Terra oldal lekezel és leáll.
+
+5) ACCEPTANCE CRITERIA (ne hagyd ki)
+- docker build sikeres
+- container indul és /healthz OK
+- engine.so betöltődik (nincs “cannot open shared object file”)
+- GPU build módban NINCS stub ág
+- build logból egyértelmű, hogy Terra engine build lefutott
+- a modell és a performancia cél NEM változik (kernel / modell logika érintetlen)
+
+Output:
+- Adj egy unified diff patch-et (vagy fájlonkénti módosítás-listát pontos kódrészletekkel), és egy rövid “how to run” részt (docker build/run parancsok).
+

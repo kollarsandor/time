@@ -1902,6 +1902,8 @@ terra run_batch_decode_ext(handle: &EngineHandle, state_ptrs: &&opaque, num_stat
     return 0
 end
 
+local linker_flags = {"-Wl,-rpath,'$ORIGIN'", "-Wl,-rpath,'$ORIGIN/.'"}
+
 terralib.saveobj("engine.so", {
     init_engine = init_engine,
     prefill = prefill,
@@ -1916,4 +1918,4 @@ terralib.saveobj("engine.so", {
     decode_step_opaque = decode_step_opaque,
     free_request_opaque = free_request_opaque,
     run_batch_decode_ext = run_batch_decode_ext
-}, nil, nil, true)
+}, linker_flags, nil, true)

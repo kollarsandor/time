@@ -4,7 +4,7 @@ modules = ["nix", "python-3.11"]
 
 [nix]
 channel = "stable-24_05"
-packages = ["cargo", "libiconv", "libxcrypt", "openssl", "pkg-config", "rustc"]
+packages = ["cargo", "libiconv", "openssl", "pkg-config", "rustc"]
 
 [agent]
 expertMode = true
@@ -41,4 +41,4 @@ mode = "sequential"
 [[workflows.workflow.tasks]]
 task = "shell.exec"
 args = """
-echo \" szia innen irok mert sima izenetet nem tudok mer t pont a kuldes gomb nal tort be a telefonom lep ernyoje.. kurvara neked kene mindent csinalnod amig nincd teljesen kesz es 3000 token/s sebeseggel valaszol a model nem nem nem en fogok futtatni semmit szoszerint mindent neked kell csinalnod a modalt innsn iranyitani stb mindent""  \""""
+echo \" szia innen irok mert sima izenetet nem tudok mer t pont a kuldes gomb nal tort be a telefonom lep ernyoje.. hibak.txt teljesen olvasx el osa irta  az utasításaidat""  \""""
