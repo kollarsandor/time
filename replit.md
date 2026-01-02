@@ -85,14 +85,22 @@ This compiles:
 ## Deployment
 
 Deploy to Modal:
-```
+```bash
 modal deploy src/python/modal_app.py
 ```
 
-Run benchmark:
-```
+Run full pipeline (download → build → validate → smoke test → benchmark):
+```bash
 modal run src/python/modal_app.py
 ```
+
+**GPU Configuration:**
+Edit `GPU_CONFIG` in `src/python/modal_app.py` to change GPU type:
+- `"H100:8"` - 8x H100 (default, high throughput)
+- `"A100:8"` - 8x A100 (widely available)
+- `"A10G:1"` - 1x A10G (cheapest for testing)
+
+**Note:** Modal billing limits may prevent large GPU jobs. Check https://modal.com/settings/billing to adjust spending limits.
 
 ## Local Testing
 

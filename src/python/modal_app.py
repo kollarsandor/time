@@ -21,23 +21,11 @@ CSRC_DIR = os.path.join(os.path.dirname(__file__), "..", "..", "csrc")
 
 image = (
     modal.Image.from_registry("nvidia/cuda:12.8.0-devel-ubuntu22.04")
-    .apt_install(
-        "git",
-        "cmake",
-        "ninja-build",
-        "wget",
-        "curl",
-        "pkg-config",
-        "libncurses5-dev",
-        "zlib1g-dev",
-        "build-essential",
-        "libedit-dev",
-        "libgmp-dev",
-        "clang",
-        "llvm",
-        "llvm-dev",
-        "libnccl2",
-        "libnccl-dev"
+    .run_commands(
+        "apt-get update && apt-get install -y --allow-change-held-packages "
+        "git cmake ninja-build wget curl pkg-config libncurses5-dev zlib1g-dev "
+        "build-essential libedit-dev libgmp-dev clang llvm llvm-dev libnccl2 libnccl-dev unzip "
+        "python3 python3-pip && ln -sf /usr/bin/python3 /usr/bin/python"
     )
     .run_commands(
         "wget https://github.com/diku-dk/futhark/releases/download/nightly/futhark-nightly-linux-x86_64.tar.xz",
@@ -46,11 +34,13 @@ image = (
         "rm -rf futhark-nightly-linux-x86_64*"
     )
     .run_commands(
-        "git clone --depth 1 https://github.com/terralang/terra.git /opt/terra",
-        "cd /opt/terra && cmake -B build -DCMAKE_INSTALL_PREFIX=/usr/local -DCMAKE_BUILD_TYPE=Release",
-        "cd /opt/terra && cmake --build build --parallel $(nproc)",
-        "cd /opt/terra && cmake --install build"
+        "wget -q https://github.com/terralang/terra/releases/download/release-1.2.0/terra-Linux-x86_64-cc543db.tar.xz -O /tmp/terra.tar.xz",
+        "tar xf /tmp/terra.tar.xz -C /opt",
+        "mv /opt/terra-* /opt/terra",
+        "ln -s /opt/terra/bin/terra /usr/local/bin/terra",
+        "rm /tmp/terra.tar.xz"
     )
+    .run_commands("python3 -m pip install --upgrade pip")
     .pip_install("transformers", "huggingface_hub", "safetensors", "tokenizers", "numpy")
     .env({
         "CUDA_HOME": "/usr/local/cuda",
@@ -631,9 +621,11 @@ class InferenceEngine:
             "num_experts": self.num_experts
         }
 
+GPU_CONFIG = "H100:8"
+
 @app.function(
     image=image,
-    gpu="B200:8",
+    gpu=GPU_CONFIG,
     volumes={"/model": volume},
     timeout=7200
 )
@@ -669,7 +661,7 @@ LOCAL_SOURCES = get_local_source_files()
 
 @app.function(
     image=image,
-    gpu="B200:8",
+    gpu=GPU_CONFIG,
     volumes={"/model": volume, "/build": build_volume},
     timeout=3600
 )
@@ -729,7 +721,7 @@ def build_engine() -> str:
 
 @app.cls(
     image=image,
-    gpu="B200:8",
+    gpu=GPU_CONFIG,
     volumes={"/model": volume, "/build": build_volume},
     allow_concurrent_inputs=128
 )
@@ -811,7 +803,7 @@ class InferenceServer:
 
 @app.function(
     image=image,
-    gpu="B200:8",
+    gpu=GPU_CONFIG,
     volumes={"/model": volume, "/build": build_volume},
     timeout=1800
 )
@@ -908,7 +900,7 @@ def run_benchmark() -> Dict[str, Any]:
 
 @app.function(
     image=image,
-    gpu="B200:8",
+    gpu=GPU_CONFIG,
     volumes={"/model": volume, "/build": build_volume},
     timeout=300
 )
@@ -946,7 +938,7 @@ def run_smoke_test() -> Dict[str, Any]:
 
 @app.function(
     image=image,
-    gpu="B200:8",
+    gpu=GPU_CONFIG,
     volumes={"/model": volume, "/build": build_volume},
     timeout=300
 )
@@ -992,7 +984,7 @@ def validate_build() -> Dict[str, Any]:
 
 @app.function(
     image=image,
-    gpu="B200:8",
+    gpu=GPU_CONFIG,
     volumes={"/model": volume, "/build": build_volume},
     timeout=600
 )
