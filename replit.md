@@ -141,6 +141,24 @@ void free_engine(EngineHandle* handle)
 - Build script creates CPU stubs when NVCC unavailable
 - Added smoke tests (tests/test_smoke.py) - all 5 pass
 
+### Latest Session Updates
+
+- Safetensors parser fix: header JSON now null-terminated before parsing (100MB sanity check)
+- GPU forward pass: cuBLAS SGEMM for lm_head matmul, FP8 dequant kernel, GPU sampling
+- Pre-allocated inference buffers (no per-token allocation)
+- Opaque pointer API: prefill_opaque, decode_step_opaque, free_request_opaque, run_batch_decode_ext
+- Error handling: prefill failures properly clean up batch state and KV pages
+- Build script: auto-detects GPU architecture (Blackwell sm_100, Hopper sm_90, Ampere sm_80, Volta sm_70)
+- run.py rewritten: real engine.so loading, AutoTokenizer, --smoke/--bench/--serve modes
+
+### Current Status
+
+- Engine provides embedding -> lm_head forward pass (no transformer layers yet)
+- GPU mode uses cuBLAS GEMM and kernel-based sampling
+- CPU mode uses pre-allocated buffers for fallback
+- Full GLM-4.7 layer stack (92 layers, MoE, attention) not yet implemented
+- Target: 3000+ tok/s requires complete GPU forward pass with attention and MoE
+
 ## CUDA/C Source Files (csrc/)
 
 - cuda_wrappers.cu/h: CUDA memory, streams, events, synchronization

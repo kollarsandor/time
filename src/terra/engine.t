@@ -166,6 +166,7 @@ struct RequestState {
     num_stop_tokens: int32
     is_prefill_done: int32
     is_finished: int32
+    gpu_next_token: CUdeviceptr
 }
 
 struct BatchState {
@@ -238,6 +239,11 @@ struct EngineHandle {
     attn_out_buffer: CUdeviceptr
     mlp_buffer: CUdeviceptr
     logits_buffer: CUdeviceptr
+    lm_head_f32_buffer: CUdeviceptr
+    hidden_buffer_cpu: &float
+    logits_buffer_cpu: &float
+    lm_head_f32_buffer_cpu: &float
+    cublas_handle: &opaque
     initialized: int32
     use_gpu: int32
 }
@@ -889,6 +895,7 @@ end
 terra allocate_inference_buffers(handle: &EngineHandle) : int32
     var hidden_size = [uint64](handle.max_batch) * [uint64](handle.max_seq) * [uint64](handle.config.hidden_dim) * 4
     var vocab_size = [uint64](handle.max_batch) * [uint64](handle.config.vocab_size) * 4
+    var lm_head_size = [uint64](handle.config.vocab_size) * [uint64](handle.config.hidden_dim) * 4
     if handle.use_gpu == 1 then
         if cw.cwMalloc(&handle.hidden_buffer, hidden_size) ~= CW_SUCCESS then return -1 end
         if cw.cwMalloc(&handle.residual_buffer, hidden_size) ~= CW_SUCCESS then return -1 end
@@ -896,6 +903,9 @@ terra allocate_inference_buffers(handle: &EngineHandle) : int32
         if cw.cwMalloc(&handle.attn_out_buffer, hidden_size) ~= CW_SUCCESS then return -1 end
         if cw.cwMalloc(&handle.mlp_buffer, hidden_size * 4) ~= CW_SUCCESS then return -1 end
         if cw.cwMalloc(&handle.logits_buffer, vocab_size) ~= CW_SUCCESS then return -1 end
+        if cw.cwMalloc(&handle.lm_head_f32_buffer, lm_head_size) ~= CW_SUCCESS then return -1 end
+        cbw.cbwCreate(&handle.cublas_handle)
+        cbw.cbwSetStream(handle.cublas_handle, handle.cuda_contexts[0].stream)
     else
         handle.hidden_buffer = [uint64](stdlib.calloc(1, hidden_size))
         handle.residual_buffer = [uint64](stdlib.calloc(1, hidden_size))
@@ -903,6 +913,9 @@ terra allocate_inference_buffers(handle: &EngineHandle) : int32
         handle.attn_out_buffer = [uint64](stdlib.calloc(1, hidden_size))
         handle.mlp_buffer = [uint64](stdlib.calloc(1, hidden_size * 4))
         handle.logits_buffer = [uint64](stdlib.calloc(1, vocab_size))
+        handle.hidden_buffer_cpu = [&float](stdlib.calloc(handle.config.hidden_dim, sizeof(float)))
+        handle.logits_buffer_cpu = [&float](stdlib.calloc(handle.config.vocab_size, sizeof(float)))
+        handle.lm_head_f32_buffer_cpu = [&float](stdlib.calloc(handle.config.vocab_size * handle.config.hidden_dim, sizeof(float)))
     end
     C.printf("Allocated inference buffers: %llu MB hidden, %llu MB logits\n", hidden_size / 1024 / 1024, vocab_size / 1024 / 1024)
     return 0
@@ -919,6 +932,10 @@ terra create_request_state(handle: &EngineHandle, request_id: int64, token_ids: 
     state.max_gen_tokens = params.max_tokens
     state.is_prefill_done = 0
     state.is_finished = 0
+    state.gpu_next_token = 0
+    if handle.use_gpu == 1 then
+        cw.cwMalloc(&state.gpu_next_token, sizeof(int64))
+    end
     var page_size = handle.kv_cache.page_size
     var num_pages = (seq_len + page_size - 1) / page_size
     state.page_indices = [&int32](stdlib.calloc(num_pages + 512, sizeof(int32)))
@@ -967,6 +984,9 @@ terra free_request_state_internal(handle: &EngineHandle, state: &RequestState) :
     end
     if state.stop_tokens ~= nil then
         stdlib.free(state.stop_tokens)
+    end
+    if state.gpu_next_token ~= 0 and handle.use_gpu == 1 then
+        cw.cwFree(state.gpu_next_token)
     end
     stdlib.free(state)
 end
@@ -1188,10 +1208,7 @@ end
 terra run_decode_step(handle: &EngineHandle, state: &RequestState, next_token: &int64) : int32
     var vocab_size = handle.config.vocab_size
     var hidden_dim = handle.config.hidden_dim
-    var logits = [&float](stdlib.calloc(vocab_size, sizeof(float)))
-    if logits == nil then return -1 end
     if handle.lm_head_weight ~= 0 then
-        var hidden = [&float](stdlib.calloc(hidden_dim, sizeof(float)))
         if handle.use_gpu == 1 then
             var last_pos = state.past_len - 1
             if last_pos < 0 then last_pos = 0 end
@@ -1200,42 +1217,49 @@ terra run_decode_step(handle: &EngineHandle, state: &RequestState, next_token: &
             cw.cwMalloc(&token_ids_d, sizeof(int64))
             cw.cwMemcpyH2D(token_ids_d, &last_token, sizeof(int64))
             kern.launch_embedding_lookup([&opaque](handle.embed_weight), [&int64](token_ids_d), [&float](handle.hidden_buffer), hidden_dim, 1, handle.embed_dtype, handle.cuda_contexts[0].stream)
+            if handle.lm_head_dtype == 1 then
+                kern.launch_fp8_dequantize([&opaque](handle.lm_head_weight), [&float](handle.lm_head_f32_buffer), vocab_size * hidden_dim, handle.cuda_contexts[0].stream)
+            end
+            var alpha: float = 1.0f
+            var beta: float = 0.0f
+            var lm_weight = handle.lm_head_f32_buffer
+            if handle.lm_head_dtype == 4 then
+                lm_weight = handle.lm_head_weight
+            end
+            cbw.cbwSgemm(handle.cublas_handle, 0, 1, 1, vocab_size, hidden_dim, &alpha, [&float](handle.hidden_buffer), 1, [&float](lm_weight), vocab_size, &beta, [&float](handle.logits_buffer), 1)
             cw.cwStreamSynchronize(handle.cuda_contexts[0].stream)
-            cw.cwMemcpyD2H(hidden, handle.hidden_buffer, hidden_dim * sizeof(float))
+            var seed = [uint64](state.request_id * 31 + state.past_len * 17)
+            seed = seed * 6364136223846793005ULL + 1442695040888963407ULL
+            kern.launch_top_p_sampling([&float](handle.logits_buffer), &state.gpu_next_token, state.temperature, state.top_p, vocab_size, 1, &seed, handle.cuda_contexts[0].stream)
+            cw.cwStreamSynchronize(handle.cuda_contexts[0].stream)
+            cw.cwMemcpyD2H(next_token, [CUdeviceptr](state.gpu_next_token), sizeof(int64))
             cw.cwFree(token_ids_d)
         else
+            var hidden = [&float](handle.hidden_buffer_cpu)
+            var logits = [&float](handle.logits_buffer_cpu)
             var last_pos = state.past_len - 1
             if last_pos < 0 then last_pos = 0 end
             embedding_lookup_cpu([&int8](handle.embed_weight), &state.past_tokens[last_pos], hidden, hidden_dim, 1, handle.embed_dtype)
-        end
-        if handle.lm_head_dtype == 1 then
-            var lm_head_f32 = [&float](stdlib.malloc(vocab_size * hidden_dim * sizeof(float)))
-            fp8_dequantize_cpu([&int8](handle.lm_head_weight), lm_head_f32, vocab_size * hidden_dim)
-            matmul_cpu(hidden, lm_head_f32, logits, 1, vocab_size, hidden_dim)
-            stdlib.free(lm_head_f32)
-        elseif handle.lm_head_dtype == 4 then
-            matmul_cpu(hidden, [&float](handle.lm_head_weight), logits, 1, vocab_size, hidden_dim)
-        else
-            var max_logit: float = -1e9f
-            for i = 0, vocab_size do
-                logits[i] = hidden[i % hidden_dim]
-                if logits[i] > max_logit then max_logit = logits[i] end
+            if handle.lm_head_dtype == 1 then
+                fp8_dequantize_cpu([&int8](handle.lm_head_weight), handle.lm_head_f32_buffer_cpu, vocab_size * hidden_dim)
+                matmul_cpu(hidden, handle.lm_head_f32_buffer_cpu, logits, 1, vocab_size, hidden_dim)
+            elseif handle.lm_head_dtype == 4 then
+                matmul_cpu(hidden, [&float](handle.lm_head_weight), logits, 1, vocab_size, hidden_dim)
+            else
+                for i = 0, vocab_size do
+                    logits[i] = hidden[i % hidden_dim]
+                end
             end
+            var seed = [uint32](state.request_id * 31 + state.past_len * 17)
+            seed = seed * 1103515245 + 12345
+            var rand_val = [float](seed % 10000) / 10000.0f
+            @next_token = sample_token_cpu(logits, vocab_size, state.temperature, state.top_p, state.rep_penalty, state.past_tokens, state.past_len, rand_val)
         end
-        stdlib.free(hidden)
     else
         var seed = [uint32](state.request_id + state.past_len)
         seed = seed * 1103515245 + 12345
-        for i = 0, vocab_size do
-            logits[i] = [float]((seed >> 16) and 0x7FFF) / 32768.0f - 0.5f
-            seed = seed * 1103515245 + 12345
-        end
+        @next_token = [int64](seed % vocab_size)
     end
-    var seed = [uint32](state.request_id * 31 + state.past_len * 17)
-    seed = seed * 1103515245 + 12345
-    var rand_val = [float](seed % 10000) / 10000.0f
-    @next_token = sample_token_cpu(logits, vocab_size, state.temperature, state.top_p, state.rep_penalty, state.past_tokens, state.past_len, rand_val)
-    stdlib.free(logits)
     var page_size = handle.kv_cache.page_size
     var new_seq_len = state.seq_len + 1
     var needed_pages = (new_seq_len + page_size - 1) / page_size
@@ -1499,6 +1523,8 @@ terra free_engine(handle: &EngineHandle) : void
         if handle.attn_out_buffer ~= 0 then cw.cwFree(handle.attn_out_buffer) end
         if handle.mlp_buffer ~= 0 then cw.cwFree(handle.mlp_buffer) end
         if handle.logits_buffer ~= 0 then cw.cwFree(handle.logits_buffer) end
+        if handle.lm_head_f32_buffer ~= 0 then cw.cwFree(handle.lm_head_f32_buffer) end
+        if handle.cublas_handle ~= nil then cbw.cbwDestroy(handle.cublas_handle) end
     else
         if handle.hidden_buffer ~= 0 then stdlib.free([&opaque](handle.hidden_buffer)) end
         if handle.residual_buffer ~= 0 then stdlib.free([&opaque](handle.residual_buffer)) end
@@ -1507,6 +1533,9 @@ terra free_engine(handle: &EngineHandle) : void
         if handle.mlp_buffer ~= 0 then stdlib.free([&opaque](handle.mlp_buffer)) end
         if handle.logits_buffer ~= 0 then stdlib.free([&opaque](handle.logits_buffer)) end
     end
+    if handle.hidden_buffer_cpu ~= nil then stdlib.free(handle.hidden_buffer_cpu) end
+    if handle.logits_buffer_cpu ~= nil then stdlib.free(handle.logits_buffer_cpu) end
+    if handle.lm_head_f32_buffer_cpu ~= nil then stdlib.free(handle.lm_head_f32_buffer_cpu) end
     if handle.shard_mappings ~= nil then
         for i = 0, handle.index.num_shards do
             if handle.shard_mappings[i].mmap_ptr ~= nil then
