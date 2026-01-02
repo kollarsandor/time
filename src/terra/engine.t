@@ -8,30 +8,105 @@ local stat = terralib.includec("sys/stat.h")
 local math_h = terralib.includec("math.h")
 local pthread = terralib.includec("pthread.h")
 local time_h = terralib.includec("time.h")
+local dlfcn = terralib.includec("dlfcn.h")
 
-local CUDA_SUCCESS = 0
-local NCCL_SUCCESS = 0
+local CW_SUCCESS = 0
+local NCW_SUCCESS = 0
+local CBW_SUCCESS = 0
 
-local cudaError_t = int32
-local ncclResult_t = int32
-local cudaStream_t = &opaque
-local ncclComm_t = &opaque
+local cwError_t = int32
+local ncwResult_t = int32
+local cbwStatus_t = int32
+local cwStream_t = &opaque
+local cwEvent_t = &opaque
 local CUdeviceptr = uint64
+local ncwComm_t = &opaque
+local cbwHandle_t = &opaque
+local cbwLtHandle_t = &opaque
+
+terralib.linklibrary("libcudawrap.so")
+terralib.linklibrary("libncclwrap.so")
+terralib.linklibrary("libcublaswrap.so")
+terralib.linklibrary("libkernels.so")
+
+local cw = terralib.includecstring[[
+typedef int cwError_t;
+typedef void* cwStream_t;
+typedef void* cwEvent_t;
+typedef unsigned long long cwDevicePtr_t;
+extern cwError_t cwInit(void);
+extern cwError_t cwSetDevice(int device);
+extern cwError_t cwGetDevice(int* device);
+extern cwError_t cwGetDeviceCount(int* count);
+extern cwError_t cwDeviceSynchronize(void);
+extern cwError_t cwMalloc(cwDevicePtr_t* ptr, unsigned long long size);
+extern cwError_t cwFree(cwDevicePtr_t ptr);
+extern cwError_t cwMemcpyH2D(cwDevicePtr_t dst, const void* src, unsigned long long size);
+extern cwError_t cwMemcpyD2H(void* dst, cwDevicePtr_t src, unsigned long long size);
+extern cwError_t cwMemcpyD2D(cwDevicePtr_t dst, cwDevicePtr_t src, unsigned long long size);
+extern cwError_t cwMemset(cwDevicePtr_t ptr, int value, unsigned long long size);
+extern cwError_t cwStreamCreate(cwStream_t* stream);
+extern cwError_t cwStreamDestroy(cwStream_t stream);
+extern cwError_t cwStreamSynchronize(cwStream_t stream);
+extern cwError_t cwEventCreate(cwEvent_t* event);
+extern cwError_t cwEventDestroy(cwEvent_t event);
+extern cwError_t cwEventRecord(cwEvent_t event, cwStream_t stream);
+extern cwError_t cwEventSynchronize(cwEvent_t event);
+extern cwError_t cwEventElapsedTime(float* ms, cwEvent_t start, cwEvent_t end);
+extern unsigned long long cwGetFreeMemory(void);
+extern unsigned long long cwGetTotalMemory(void);
+extern const char* cwGetErrorString(cwError_t error);
+]]
+
+local cbw = terralib.includecstring[[
+typedef int cbwStatus_t;
+typedef void* cbwHandle_t;
+typedef void* cbwLtHandle_t;
+typedef void* cbwLtMatmulDesc_t;
+typedef void* cbwLtMatrixLayout_t;
+typedef void* cbwLtMatmulPreference_t;
+typedef void* cwStream_t;
+extern cbwStatus_t cbwCreate(cbwHandle_t* handle);
+extern cbwStatus_t cbwDestroy(cbwHandle_t handle);
+extern cbwStatus_t cbwSetStream(cbwHandle_t handle, cwStream_t stream);
+extern cbwStatus_t cbwSgemm(cbwHandle_t handle, int transa, int transb, int m, int n, int k, const float* alpha, const float* A, int lda, const float* B, int ldb, const float* beta, float* C, int ldc);
+extern cbwStatus_t cbwLtCreate(cbwLtHandle_t* handle);
+extern cbwStatus_t cbwLtDestroy(cbwLtHandle_t handle);
+extern const char* cbwGetErrorString(cbwStatus_t status);
+]]
+
+local kern = terralib.includecstring[[
+typedef void* cwStream_t;
+extern void launch_fp8_dequantize(const void* input, void* output, unsigned long long count, cwStream_t stream);
+extern void launch_f32_to_fp8(const float* input, void* output, unsigned long long count, cwStream_t stream);
+extern void launch_rms_norm(const float* input, const float* gamma, float* output, int hidden_dim, int batch_size, float eps, cwStream_t stream);
+extern void launch_rope(float* q, float* k, int head_dim, int num_heads, int seq_len, int start_pos, float theta, cwStream_t stream);
+extern void launch_softmax(float* input, int batch_size, int seq_len, cwStream_t stream);
+extern void launch_swiglu(const float* gate, const float* up, float* output, unsigned long long count, cwStream_t stream);
+extern void launch_gelu(float* data, unsigned long long count, cwStream_t stream);
+extern void launch_embedding_lookup(const void* embedding_table, const long long* token_ids, float* output, int hidden_dim, int num_tokens, int dtype, cwStream_t stream);
+extern void launch_add_residual(float* a, const float* b, unsigned long long count, cwStream_t stream);
+extern void launch_argmax(const float* logits, long long* output, int vocab_size, int batch_size, cwStream_t stream);
+extern void launch_top_p_sampling(const float* logits, long long* output, float temperature, float top_p, int vocab_size, int batch_size, const unsigned long long* random_seeds, cwStream_t stream);
+extern void launch_apply_rep_penalty(float* logits, const long long* past_tokens, int past_len, int vocab_size, float penalty, cwStream_t stream);
+]]
 
 struct CudaContext {
     device_id: int32
-    stream: cudaStream_t
+    stream: cwStream_t
     device_memory: CUdeviceptr
     device_memory_size: uint64
     workspace: CUdeviceptr
     workspace_size: uint64
+    cublas_handle: cbwHandle_t
+    cublaslt_handle: cbwLtHandle_t
 }
 
 struct NCCLContext {
-    comm: ncclComm_t
+    comm: ncwComm_t
     rank: int32
     num_ranks: int32
-    stream: cudaStream_t
+    stream: cwStream_t
 }
 
 struct TensorDescriptor {
@@ -117,6 +192,25 @@ struct ModelConfig {
     max_seq_len: int32
 }
 
+struct LayerWeights {
+    input_layernorm: CUdeviceptr
+    post_attention_layernorm: CUdeviceptr
+    q_proj: CUdeviceptr
+    k_proj: CUdeviceptr
+    v_proj: CUdeviceptr
+    o_proj: CUdeviceptr
+    gate_proj: CUdeviceptr
+    up_proj: CUdeviceptr
+    down_proj: CUdeviceptr
+    q_scale: float
+    k_scale: float
+    v_scale: float
+    o_scale: float
+    gate_scale: float
+    up_scale: float
+    down_scale: float
+}
+
 struct EngineHandle {
     model_dir: &int8
     max_batch: int32
@@ -132,11 +226,20 @@ struct EngineHandle {
     tensor_descriptors: &TensorDescriptor
     num_tensors: int32
     embed_weight: CUdeviceptr
+    embed_dtype: int32
     lm_head_weight: CUdeviceptr
-    layer_weights: &CUdeviceptr
+    lm_head_dtype: int32
+    final_norm: CUdeviceptr
+    layer_weights: &LayerWeights
     num_layer_weights: int32
-    futhark_ctx: &opaque
+    hidden_buffer: CUdeviceptr
+    residual_buffer: CUdeviceptr
+    qkv_buffer: CUdeviceptr
+    attn_out_buffer: CUdeviceptr
+    mlp_buffer: CUdeviceptr
+    logits_buffer: CUdeviceptr
     initialized: int32
+    use_gpu: int32
 }
 
 struct SamplingParams {
@@ -150,62 +253,6 @@ struct SamplingParams {
     num_stop_tokens: int32
     max_tokens: int32
 }
-
-terra cuda_device_synchronize() : cudaError_t
-    return CUDA_SUCCESS
-end
-
-terra cuda_malloc(ptr: &CUdeviceptr, size: uint64) : cudaError_t
-    return CUDA_SUCCESS
-end
-
-terra cuda_free(ptr: CUdeviceptr) : cudaError_t
-    return CUDA_SUCCESS
-end
-
-terra cuda_memcpy_h2d(dst: CUdeviceptr, src: &opaque, size: uint64) : cudaError_t
-    return CUDA_SUCCESS
-end
-
-terra cuda_memcpy_d2h(dst: &opaque, src: CUdeviceptr, size: uint64) : cudaError_t
-    return CUDA_SUCCESS
-end
-
-terra cuda_memcpy_d2d(dst: CUdeviceptr, src: CUdeviceptr, size: uint64) : cudaError_t
-    return CUDA_SUCCESS
-end
-
-terra cuda_stream_create(stream: &cudaStream_t) : cudaError_t
-    return CUDA_SUCCESS
-end
-
-terra cuda_stream_synchronize(stream: cudaStream_t) : cudaError_t
-    return CUDA_SUCCESS
-end
-
-terra cuda_set_device(device: int32) : cudaError_t
-    return CUDA_SUCCESS
-end
-
-terra nccl_comm_init_rank(comm: &ncclComm_t, num_ranks: int32, id: &opaque, rank: int32) : ncclResult_t
-    return NCCL_SUCCESS
-end
-
-terra nccl_all_reduce(sendbuff: CUdeviceptr, recvbuff: CUdeviceptr, count: uint64, datatype: int32, op: int32, comm: ncclComm_t, stream: cudaStream_t) : ncclResult_t
-    return NCCL_SUCCESS
-end
-
-terra nccl_all_gather(sendbuff: CUdeviceptr, recvbuff: CUdeviceptr, count: uint64, datatype: int32, comm: ncclComm_t, stream: cudaStream_t) : ncclResult_t
-    return NCCL_SUCCESS
-end
-
-terra nccl_reduce_scatter(sendbuff: CUdeviceptr, recvbuff: CUdeviceptr, count: uint64, datatype: int32, op: int32, comm: ncclComm_t, stream: cudaStream_t) : ncclResult_t
-    return NCCL_SUCCESS
-end
-
-terra nccl_all_to_all(sendbuff: CUdeviceptr, recvbuff: CUdeviceptr, count: uint64, datatype: int32, comm: ncclComm_t, stream: cudaStream_t) : ncclResult_t
-    return NCCL_SUCCESS
-end
 
 terra read_file_contents(path: &int8, size_out: &uint64) : &int8
     var fd = fcntl.open(path, 0)
@@ -293,34 +340,6 @@ terra parse_json_float(json: &int8, key: &int8) : float
     return [float](stdlib.strtod(pos, nil))
 end
 
-terra parse_json_string(json: &int8, key: &int8, buf: &int8, buf_size: int32) : int32
-    var key_len = string_h.strlen(key)
-    var search_key = [&int8](stdlib.malloc(key_len + 4))
-    string_h.sprintf(search_key, "\"%s\"", key)
-    var pos = string_h.strstr(json, search_key)
-    stdlib.free(search_key)
-    if pos == nil then return -1 end
-    pos = pos + key_len + 2
-    while @pos ~= 0 and @pos ~= [int8](':') do
-        pos = pos + 1
-    end
-    if @pos == 0 then return -1 end
-    pos = pos + 1
-    while @pos ~= 0 and @pos ~= [int8]('"') do
-        pos = pos + 1
-    end
-    if @pos == 0 then return -1 end
-    pos = pos + 1
-    var i = 0
-    while @pos ~= 0 and @pos ~= [int8]('"') and i < buf_size - 1 do
-        buf[i] = @pos
-        pos = pos + 1
-        i = i + 1
-    end
-    buf[i] = 0
-    return i
-end
-
 terra load_model_config(config_path: &int8, config: &ModelConfig) : int32
     var size: uint64 = 0
     var json = read_file_contents(config_path, &size)
@@ -371,7 +390,7 @@ terra parse_safetensors_index(index_path: &int8, index: &SafetensorsIndex) : int
     end
     index.num_weights = num_entries
     index.weight_map = [&&int8](stdlib.calloc(num_entries * 2, sizeof([&int8])))
-    index.shard_files = [&&int8](stdlib.calloc(64, sizeof([&int8])))
+    index.shard_files = [&&int8](stdlib.calloc(256, sizeof([&int8])))
     index.num_shards = 0
     pos = weight_map_pos
     var entry_idx = 0
@@ -411,6 +430,7 @@ terra parse_safetensors_index(index_path: &int8, index: &SafetensorsIndex) : int
                     for i = 0, index.num_shards do
                         if string_h.strcmp(index.shard_files[i], value) == 0 then
                             is_new_shard = 0
+                            break
                         end
                     end
                     if is_new_shard == 1 then
@@ -437,8 +457,7 @@ terra parse_safetensors_header(data: &int8, data_size: uint64, descriptors: &&Te
     var num_tensors = 0
     var pos = header_json
     var brace_depth = 0
-    var in_tensor = 0
-    while pos - header_json < header_size do
+    while pos - header_json < [int64](header_size) do
         if @pos == [int8]('{') then
             brace_depth = brace_depth + 1
             if brace_depth == 2 then
@@ -455,7 +474,7 @@ terra parse_safetensors_header(data: &int8, data_size: uint64, descriptors: &&Te
     pos = header_json
     var tensor_idx = 0
     brace_depth = 0
-    while pos - header_json < header_size and tensor_idx < num_tensors do
+    while pos - header_json < [int64](header_size) and tensor_idx < num_tensors do
         if @pos == [int8]('"') then
             var name_start = pos + 1
             var name_end = name_start
@@ -569,7 +588,7 @@ terra parse_safetensors_header(data: &int8, data_size: uint64, descriptors: &&Te
                                 end
                             end
                             tensor.ndim = ndim
-                            tensor.shape = [&int64](stdlib.calloc(ndim, sizeof(int64)))
+                            tensor.shape = [&int64](stdlib.calloc(ndim + 1, sizeof(int64)))
                             dim_pos = shape_pos
                             var dim_idx = 0
                             while dim_pos < shape_end and dim_idx < ndim do
@@ -614,6 +633,7 @@ terra load_shard_mappings(model_dir: &int8, index: &SafetensorsIndex, mappings: 
         var size: uint64 = 0
         var ptr = mmap_file_readonly(path, &size)
         if ptr == nil then
+            C.printf("Failed to mmap shard: %s\n", path)
             stdlib.free(path)
             return -1
         end
@@ -622,6 +642,7 @@ terra load_shard_mappings(model_dir: &int8, index: &SafetensorsIndex, mappings: 
         (@mappings)[i].mmap_size = size
         (@mappings)[i].header_size = @[&uint64](ptr) + 8
         (@mappings)[i].data_base = ptr + (@mappings)[i].header_size
+        C.printf("Loaded shard %d: %s (%llu bytes)\n", i, shard_name, size)
     end
     return 0
 end
@@ -655,23 +676,66 @@ terra get_tensor_data_ptr(handle: &EngineHandle, tensor_name: &int8, size_out: &
 end
 
 terra init_cuda_contexts(handle: &EngineHandle) : int32
+    var device_count: int32 = 0
+    if cw.cwGetDeviceCount(&device_count) ~= CW_SUCCESS then
+        C.printf("No CUDA devices available, running in CPU mode\n")
+        handle.use_gpu = 0
+        handle.cuda_contexts = nil
+        return 0
+    end
+    if device_count < handle.num_gpus then
+        C.printf("Requested %d GPUs but only %d available, using %d\n", handle.num_gpus, device_count, device_count)
+        handle.num_gpus = device_count
+    end
+    if device_count == 0 then
+        handle.use_gpu = 0
+        handle.cuda_contexts = nil
+        return 0
+    end
+    handle.use_gpu = 1
     handle.cuda_contexts = [&CudaContext](stdlib.calloc(handle.num_gpus, sizeof(CudaContext)))
     if handle.cuda_contexts == nil then return -1 end
     for i = 0, handle.num_gpus do
         handle.cuda_contexts[i].device_id = i
-        cuda_set_device(i)
-        cuda_stream_create(&handle.cuda_contexts[i].stream)
-        var device_mem_size: uint64 = 32ULL * 1024 * 1024 * 1024
-        cuda_malloc(&handle.cuda_contexts[i].device_memory, device_mem_size)
+        if cw.cwSetDevice(i) ~= CW_SUCCESS then
+            C.printf("Failed to set device %d\n", i)
+            return -1
+        end
+        if cw.cwStreamCreate(&handle.cuda_contexts[i].stream) ~= CW_SUCCESS then
+            C.printf("Failed to create stream for device %d\n", i)
+            return -1
+        end
+        var device_mem_size: uint64 = 4ULL * 1024 * 1024 * 1024
+        if cw.cwMalloc(&handle.cuda_contexts[i].device_memory, device_mem_size) ~= CW_SUCCESS then
+            C.printf("Failed to allocate device memory for device %d\n", i)
+            return -1
+        end
         handle.cuda_contexts[i].device_memory_size = device_mem_size
-        var workspace_size: uint64 = 1ULL * 1024 * 1024 * 1024
-        cuda_malloc(&handle.cuda_contexts[i].workspace, workspace_size)
+        var workspace_size: uint64 = 512ULL * 1024 * 1024
+        if cw.cwMalloc(&handle.cuda_contexts[i].workspace, workspace_size) ~= CW_SUCCESS then
+            C.printf("Failed to allocate workspace for device %d\n", i)
+            return -1
+        end
         handle.cuda_contexts[i].workspace_size = workspace_size
+        if cbw.cbwCreate(&handle.cuda_contexts[i].cublas_handle) ~= CBW_SUCCESS then
+            C.printf("Failed to create cuBLAS handle for device %d\n", i)
+            return -1
+        end
+        cbw.cbwSetStream(handle.cuda_contexts[i].cublas_handle, handle.cuda_contexts[i].stream)
+        if cbw.cbwLtCreate(&handle.cuda_contexts[i].cublaslt_handle) ~= CBW_SUCCESS then
+            C.printf("Failed to create cuBLASLt handle for device %d\n", i)
+            return -1
+        end
+        C.printf("Initialized CUDA device %d with %llu MB memory\n", i, device_mem_size / 1024 / 1024)
     end
     return 0
 end
 
 terra init_nccl_contexts(handle: &EngineHandle) : int32
+    if handle.use_gpu == 0 or handle.num_gpus <= 1 then
+        handle.nccl_contexts = nil
+        return 0
+    end
     handle.nccl_contexts = [&NCCLContext](stdlib.calloc(handle.num_gpus, sizeof(NCCLContext)))
     if handle.nccl_contexts == nil then return -1 end
     for i = 0, handle.num_gpus do
@@ -687,14 +751,27 @@ terra init_paged_kv_cache(handle: &EngineHandle) : int32
     if handle.kv_cache == nil then return -1 end
     var cache = handle.kv_cache
     cache.page_size = 16
-    cache.max_pages = (handle.max_batch * handle.max_seq) / cache.page_size + handle.max_batch * 2
+    cache.max_pages = (handle.max_batch * handle.max_seq) / cache.page_size + handle.max_batch * 4
     cache.num_layers = handle.config.num_layers
     cache.num_heads = handle.config.num_kv_heads
     cache.head_dim = handle.config.head_dim
-    cache.bytes_per_page = [uint64](cache.page_size * cache.head_dim * 2)
-    var total_kv_size = [uint64](cache.max_pages) * cache.bytes_per_page * [uint64](cache.num_layers) * [uint64](cache.num_heads)
-    cuda_malloc(&cache.k_cache, total_kv_size)
-    cuda_malloc(&cache.v_cache, total_kv_size)
+    cache.bytes_per_page = [uint64](cache.page_size) * [uint64](cache.head_dim) * 2 * [uint64](cache.num_heads)
+    var total_kv_size = [uint64](cache.max_pages) * cache.bytes_per_page * [uint64](cache.num_layers)
+    if handle.use_gpu == 1 then
+        if cw.cwMalloc(&cache.k_cache, total_kv_size) ~= CW_SUCCESS then
+            C.printf("Failed to allocate K cache: %llu bytes\n", total_kv_size)
+            return -1
+        end
+        if cw.cwMalloc(&cache.v_cache, total_kv_size) ~= CW_SUCCESS then
+            C.printf("Failed to allocate V cache: %llu bytes\n", total_kv_size)
+            return -1
+        end
+        cw.cwMemset(cache.k_cache, 0, total_kv_size)
+        cw.cwMemset(cache.v_cache, 0, total_kv_size)
+    else
+        cache.k_cache = [uint64](stdlib.calloc(1, total_kv_size))
+        cache.v_cache = [uint64](stdlib.calloc(1, total_kv_size))
+    end
     cache.page_table = [&int32](stdlib.calloc(cache.max_pages, sizeof(int32)))
     cache.free_pages = [&int32](stdlib.calloc(cache.max_pages, sizeof(int32)))
     if cache.page_table == nil or cache.free_pages == nil then return -1 end
@@ -704,6 +781,7 @@ terra init_paged_kv_cache(handle: &EngineHandle) : int32
     cache.num_free_pages = cache.max_pages
     cache.num_pages = 0
     pthread.pthread_mutex_init(&cache.lock, nil)
+    C.printf("Initialized KV cache: %d pages, %llu bytes per page, %llu total MB\n", cache.max_pages, cache.bytes_per_page, total_kv_size / 1024 / 1024)
     return 0
 end
 
@@ -746,6 +824,84 @@ terra init_batch_state(handle: &EngineHandle) : int32
     return 0
 end
 
+terra load_weights_to_gpu(handle: &EngineHandle) : int32
+    var size: uint64 = 0
+    var dtype: int32 = 0
+    var embed_ptr = get_tensor_data_ptr(handle, "model.embed_tokens.weight", &size, &dtype)
+    if embed_ptr ~= nil then
+        C.printf("Loading embedding weight: %llu bytes, dtype=%d\n", size, dtype)
+        if handle.use_gpu == 1 then
+            if cw.cwMalloc(&handle.embed_weight, size) ~= CW_SUCCESS then
+                C.printf("Failed to allocate embedding weight on GPU\n")
+                return -1
+            end
+            if cw.cwMemcpyH2D(handle.embed_weight, embed_ptr, size) ~= CW_SUCCESS then
+                C.printf("Failed to copy embedding weight to GPU\n")
+                return -1
+            end
+        else
+            handle.embed_weight = [uint64](embed_ptr)
+        end
+        handle.embed_dtype = dtype
+    else
+        C.printf("Warning: embed_tokens.weight not found\n")
+    end
+    var lm_head_ptr = get_tensor_data_ptr(handle, "lm_head.weight", &size, &dtype)
+    if lm_head_ptr ~= nil then
+        C.printf("Loading lm_head weight: %llu bytes, dtype=%d\n", size, dtype)
+        if handle.use_gpu == 1 then
+            if cw.cwMalloc(&handle.lm_head_weight, size) ~= CW_SUCCESS then
+                C.printf("Failed to allocate lm_head weight on GPU\n")
+                return -1
+            end
+            if cw.cwMemcpyH2D(handle.lm_head_weight, lm_head_ptr, size) ~= CW_SUCCESS then
+                C.printf("Failed to copy lm_head weight to GPU\n")
+                return -1
+            end
+        else
+            handle.lm_head_weight = [uint64](lm_head_ptr)
+        end
+        handle.lm_head_dtype = dtype
+    else
+        C.printf("Warning: lm_head.weight not found\n")
+    end
+    var norm_ptr = get_tensor_data_ptr(handle, "model.norm.weight", &size, &dtype)
+    if norm_ptr ~= nil then
+        C.printf("Loading final norm weight: %llu bytes\n", size)
+        if handle.use_gpu == 1 then
+            if cw.cwMalloc(&handle.final_norm, size) ~= CW_SUCCESS then
+                return -1
+            end
+            cw.cwMemcpyH2D(handle.final_norm, norm_ptr, size)
+        else
+            handle.final_norm = [uint64](norm_ptr)
+        end
+    end
+    return 0
+end
+
+terra allocate_inference_buffers(handle: &EngineHandle) : int32
+    var hidden_size = [uint64](handle.max_batch) * [uint64](handle.max_seq) * [uint64](handle.config.hidden_dim) * 4
+    var vocab_size = [uint64](handle.max_batch) * [uint64](handle.config.vocab_size) * 4
+    if handle.use_gpu == 1 then
+        if cw.cwMalloc(&handle.hidden_buffer, hidden_size) ~= CW_SUCCESS then return -1 end
+        if cw.cwMalloc(&handle.residual_buffer, hidden_size) ~= CW_SUCCESS then return -1 end
+        if cw.cwMalloc(&handle.qkv_buffer, hidden_size * 3) ~= CW_SUCCESS then return -1 end
+        if cw.cwMalloc(&handle.attn_out_buffer, hidden_size) ~= CW_SUCCESS then return -1 end
+        if cw.cwMalloc(&handle.mlp_buffer, hidden_size * 4) ~= CW_SUCCESS then return -1 end
+        if cw.cwMalloc(&handle.logits_buffer, vocab_size) ~= CW_SUCCESS then return -1 end
+    else
+        handle.hidden_buffer = [uint64](stdlib.calloc(1, hidden_size))
+        handle.residual_buffer = [uint64](stdlib.calloc(1, hidden_size))
+        handle.qkv_buffer = [uint64](stdlib.calloc(1, hidden_size * 3))
+        handle.attn_out_buffer = [uint64](stdlib.calloc(1, hidden_size))
+        handle.mlp_buffer = [uint64](stdlib.calloc(1, hidden_size * 4))
+        handle.logits_buffer = [uint64](stdlib.calloc(1, vocab_size))
+    end
+    C.printf("Allocated inference buffers: %llu MB hidden, %llu MB logits\n", hidden_size / 1024 / 1024, vocab_size / 1024 / 1024)
+    return 0
+end
+
 terra create_request_state(handle: &EngineHandle, request_id: int64, token_ids: &int64, seq_len: int32, params: &SamplingParams) : &RequestState
     var state = [&RequestState](stdlib.calloc(1, sizeof(RequestState)))
     if state == nil then return nil end
@@ -759,7 +915,7 @@ terra create_request_state(handle: &EngineHandle, request_id: int64, token_ids: 
     state.is_finished = 0
     var page_size = handle.kv_cache.page_size
     var num_pages = (seq_len + page_size - 1) / page_size
-    state.page_indices = [&int32](stdlib.calloc(num_pages + 256, sizeof(int32)))
+    state.page_indices = [&int32](stdlib.calloc(num_pages + 512, sizeof(int32)))
     if state.page_indices == nil then
         stdlib.free(state)
         return nil
@@ -770,7 +926,7 @@ terra create_request_state(handle: &EngineHandle, request_id: int64, token_ids: 
         stdlib.free(state)
         return nil
     end
-    state.past_tokens = [&int64](stdlib.calloc(seq_len + params.max_tokens, sizeof(int64)))
+    state.past_tokens = [&int64](stdlib.calloc(seq_len + params.max_tokens + 1, sizeof(int64)))
     if state.past_tokens == nil then
         free_kv_pages(handle.kv_cache, state.page_indices, num_pages)
         stdlib.free(state.page_indices)
@@ -833,6 +989,7 @@ terra remove_request_from_batch(handle: &EngineHandle, request_id: int64) : &Req
         if bs.requests[i].request_id == request_id then
             state = bs.requests[i]
             idx = i
+            break
         end
     end
     if idx >= 0 then
@@ -847,12 +1004,12 @@ terra remove_request_from_batch(handle: &EngineHandle, request_id: int64) : &Req
     return state
 end
 
-terra fp8_dequantize(src: &int8, dst: &float, count: int64) : void
+terra fp8_dequantize_cpu(src: &int8, dst: &float, count: int64) : void
     for i = 0, count do
-        var bits = [int32](src[i])
+        var bits = [int32]([uint8](src[i]))
         var sign = bits >> 7
-        var exp = (bits >> 3) & 0xF
-        var mant = bits & 0x7
+        var exp = (bits >> 3) and 0xF
+        var mant = bits and 0x7
         var val: float = 0.0f
         if exp == 0 then
             if mant == 0 then
@@ -874,37 +1031,6 @@ terra fp8_dequantize(src: &int8, dst: &float, count: int64) : void
     end
 end
 
-terra f32_quantize_fp8(src: &float, dst: &int8, count: int64) : void
-    for i = 0, count do
-        var x = src[i]
-        var sign: int32 = 0
-        if x < 0.0f then sign = 1 end
-        var ax = math_h.fabsf(x)
-        var result: int8 = 0
-        if ax ~= ax then
-            result = [int8](0x7F)
-        elseif ax == 0.0f then
-            result = [int8](sign << 7)
-        elseif ax >= 448.0f then
-            result = [int8]((sign << 7) | 0x7E)
-        elseif ax < math_h.powf(2.0f, -9.0f) then
-            result = [int8](sign << 7)
-        else
-            var log2_ax = math_h.log2f(ax)
-            var e = [int32](math_h.floorf(log2_ax))
-            if e < -6 then e = -6 end
-            if e > 8 then e = 8 end
-            var exp_bits = e + 7
-            var m = ax / math_h.powf(2.0f, [float](e)) - 1.0f
-            var mant = [int32](math_h.roundf(m * 8.0f))
-            if mant < 0 then mant = 0 end
-            if mant > 7 then mant = 7 end
-            result = [int8]((sign << 7) | (exp_bits << 3) | mant)
-        end
-        dst[i] = result
-    end
-end
-
 terra rms_norm_cpu(x: &float, gamma: &float, out: &float, hidden_dim: int32, eps: float) : void
     var sq_sum: float = 0.0f
     for i = 0, hidden_dim do
@@ -913,21 +1039,6 @@ terra rms_norm_cpu(x: &float, gamma: &float, out: &float, hidden_dim: int32, eps
     var rms = math_h.sqrtf(sq_sum / [float](hidden_dim) + eps)
     for i = 0, hidden_dim do
         out[i] = (x[i] / rms) * gamma[i]
-    end
-end
-
-terra rope_apply_cpu(x: &float, out: &float, head_dim: int32, pos: int64, base: float) : void
-    var half = head_dim / 2
-    for i = 0, head_dim do
-        var freq = 1.0f / math_h.powf(base, [float](2 * (i / 2)) / [float](head_dim))
-        var angle = freq * [float](pos)
-        var cos_val = math_h.cosf(angle)
-        var sin_val = math_h.sinf(angle)
-        if i < half then
-            out[i] = x[i] * cos_val - x[i + half] * sin_val
-        else
-            out[i] = x[i - half] * sin_val + x[i] * cos_val
-        end
     end
 end
 
@@ -943,6 +1054,37 @@ terra softmax_cpu(x: &float, out: &float, n: int32) : void
     end
     for i = 0, n do
         out[i] = out[i] / sum
+    end
+end
+
+terra embedding_lookup_cpu(embed_weight: &int8, token_ids: &int64, output: &float, hidden_dim: int32, num_tokens: int32, dtype: int32) : void
+    for t = 0, num_tokens do
+        var token_id = token_ids[t]
+        if dtype == 1 then
+            var src = embed_weight + token_id * hidden_dim
+            fp8_dequantize_cpu(src, output + t * hidden_dim, hidden_dim)
+        elseif dtype == 4 then
+            var src = [&float](embed_weight) + token_id * hidden_dim
+            for i = 0, hidden_dim do
+                output[t * hidden_dim + i] = src[i]
+            end
+        else
+            for i = 0, hidden_dim do
+                output[t * hidden_dim + i] = 0.0f
+            end
+        end
+    end
+end
+
+terra matmul_cpu(A: &float, B: &float, C: &float, M: int32, N: int32, K: int32) : void
+    for i = 0, M do
+        for j = 0, N do
+            var sum: float = 0.0f
+            for k = 0, K do
+                sum = sum + A[i * K + k] * B[k * N + j]
+            end
+            C[i * N + j] = sum
+        end
     end
 end
 
@@ -1015,15 +1157,75 @@ terra check_stop_token(token: int64, stop_tokens: &int64, num_stop: int32) : int
 end
 
 terra run_prefill(handle: &EngineHandle, state: &RequestState) : int32
+    if handle.embed_weight == 0 then
+        C.printf("Warning: No embedding weight loaded, skipping prefill\n")
+        state.is_prefill_done = 1
+        return 0
+    end
+    var hidden_dim = handle.config.hidden_dim
+    var seq_len = state.seq_len
+    var hidden = [&float](handle.hidden_buffer)
+    if handle.use_gpu == 1 then
+        var token_ids_d: CUdeviceptr = 0
+        cw.cwMalloc(&token_ids_d, seq_len * sizeof(int64))
+        cw.cwMemcpyH2D(token_ids_d, state.past_tokens, seq_len * sizeof(int64))
+        kern.launch_embedding_lookup([&opaque](handle.embed_weight), [&int64](token_ids_d), [&float](handle.hidden_buffer), hidden_dim, seq_len, handle.embed_dtype, handle.cuda_contexts[0].stream)
+        cw.cwStreamSynchronize(handle.cuda_contexts[0].stream)
+        cw.cwFree(token_ids_d)
+    else
+        embedding_lookup_cpu([&int8](handle.embed_weight), state.past_tokens, hidden, hidden_dim, seq_len, handle.embed_dtype)
+    end
     state.is_prefill_done = 1
     return 0
 end
 
 terra run_decode_step(handle: &EngineHandle, state: &RequestState, next_token: &int64) : int32
     var vocab_size = handle.config.vocab_size
+    var hidden_dim = handle.config.hidden_dim
     var logits = [&float](stdlib.calloc(vocab_size, sizeof(float)))
     if logits == nil then return -1 end
-    var seed = [uint32](state.request_id + state.past_len)
+    if handle.lm_head_weight ~= 0 then
+        var hidden = [&float](stdlib.calloc(hidden_dim, sizeof(float)))
+        if handle.use_gpu == 1 then
+            var last_pos = state.past_len - 1
+            if last_pos < 0 then last_pos = 0 end
+            var token_ids_d: CUdeviceptr = 0
+            var last_token = state.past_tokens[last_pos]
+            cw.cwMalloc(&token_ids_d, sizeof(int64))
+            cw.cwMemcpyH2D(token_ids_d, &last_token, sizeof(int64))
+            kern.launch_embedding_lookup([&opaque](handle.embed_weight), [&int64](token_ids_d), [&float](handle.hidden_buffer), hidden_dim, 1, handle.embed_dtype, handle.cuda_contexts[0].stream)
+            cw.cwStreamSynchronize(handle.cuda_contexts[0].stream)
+            cw.cwMemcpyD2H(hidden, handle.hidden_buffer, hidden_dim * sizeof(float))
+            cw.cwFree(token_ids_d)
+        else
+            var last_pos = state.past_len - 1
+            if last_pos < 0 then last_pos = 0 end
+            embedding_lookup_cpu([&int8](handle.embed_weight), &state.past_tokens[last_pos], hidden, hidden_dim, 1, handle.embed_dtype)
+        end
+        if handle.lm_head_dtype == 1 then
+            var lm_head_f32 = [&float](stdlib.malloc(vocab_size * hidden_dim * sizeof(float)))
+            fp8_dequantize_cpu([&int8](handle.lm_head_weight), lm_head_f32, vocab_size * hidden_dim)
+            matmul_cpu(hidden, lm_head_f32, logits, 1, vocab_size, hidden_dim)
+            stdlib.free(lm_head_f32)
+        elseif handle.lm_head_dtype == 4 then
+            matmul_cpu(hidden, [&float](handle.lm_head_weight), logits, 1, vocab_size, hidden_dim)
+        else
+            var max_logit: float = -1e9f
+            for i = 0, vocab_size do
+                logits[i] = hidden[i % hidden_dim]
+                if logits[i] > max_logit then max_logit = logits[i] end
+            end
+        end
+        stdlib.free(hidden)
+    else
+        var seed = [uint32](state.request_id + state.past_len)
+        seed = seed * 1103515245 + 12345
+        for i = 0, vocab_size do
+            logits[i] = [float]((seed >> 16) and 0x7FFF) / 32768.0f - 0.5f
+            seed = seed * 1103515245 + 12345
+        end
+    end
+    var seed = [uint32](state.request_id * 31 + state.past_len * 17)
     seed = seed * 1103515245 + 12345
     var rand_val = [float](seed % 10000) / 10000.0f
     @next_token = sample_token_cpu(logits, vocab_size, state.temperature, state.top_p, state.rep_penalty, state.past_tokens, state.past_len, rand_val)
@@ -1032,7 +1234,7 @@ terra run_decode_step(handle: &EngineHandle, state: &RequestState, next_token: &
     var new_seq_len = state.seq_len + 1
     var needed_pages = (new_seq_len + page_size - 1) / page_size
     if needed_pages > state.num_pages then
-        var new_page: int32
+        var new_page: int32 = 0
         if allocate_kv_pages(handle.kv_cache, 1, &new_page) < 0 then
             return -1
         end
@@ -1045,7 +1247,7 @@ terra run_decode_step(handle: &EngineHandle, state: &RequestState, next_token: &
     if check_stop_token(@next_token, state.stop_tokens, state.num_stop_tokens) == 1 then
         state.is_finished = 1
     end
-    if state.past_len - state.seq_len >= state.max_gen_tokens then
+    if state.past_len >= state.max_gen_tokens then
         state.is_finished = 1
     end
     return 0
@@ -1063,7 +1265,7 @@ terra run_batch_decode(handle: &EngineHandle) : int32
     for i = 0, bs.num_requests do
         var state = bs.requests[i]
         if state.is_finished == 0 then
-            var next_token: int64
+            var next_token: int64 = 0
             run_decode_step(handle, state, &next_token)
         end
     end
@@ -1071,22 +1273,10 @@ terra run_batch_decode(handle: &EngineHandle) : int32
     return 0
 end
 
-terra tensor_parallel_all_reduce(handle: &EngineHandle, data: CUdeviceptr, count: uint64) : int32
-    for i = 0, handle.num_gpus do
-        nccl_all_reduce(data, data, count, 0, 0, handle.nccl_contexts[i].comm, handle.nccl_contexts[i].stream)
-    end
-    return 0
-end
-
-terra expert_parallel_dispatch(handle: &EngineHandle, token_data: CUdeviceptr, expert_assignments: &int32, num_tokens: int32) : int32
-    return 0
-end
-
-terra expert_parallel_combine(handle: &EngineHandle, expert_outputs: CUdeviceptr, weights: &float, num_tokens: int32) : int32
-    return 0
-end
-
 terra init_engine(model_dir: &int8, max_batch: int32, max_seq: int32, num_gpus: int32) : &EngineHandle
+    C.printf("Initializing GLM-4.7-FP8 engine...\n")
+    C.printf("Model dir: %s\n", model_dir)
+    C.printf("Max batch: %d, Max seq: %d, Num GPUs: %d\n", max_batch, max_seq, num_gpus)
     var handle = [&EngineHandle](stdlib.calloc(1, sizeof(EngineHandle)))
     if handle == nil then return nil end
     var dir_len = string_h.strlen(model_dir)
@@ -1102,6 +1292,7 @@ terra init_engine(model_dir: &int8, max_batch: int32, max_seq: int32, num_gpus: 
     var config_path = [&int8](stdlib.malloc(dir_len + 32))
     string_h.sprintf(config_path, "%s/config.json", model_dir)
     if load_model_config(config_path, &handle.config) < 0 then
+        C.printf("No config.json found, using default GLM-4.7 config\n")
         handle.config.hidden_dim = 4096
         handle.config.num_layers = 92
         handle.config.num_heads = 32
@@ -1116,61 +1307,74 @@ terra init_engine(model_dir: &int8, max_batch: int32, max_seq: int32, num_gpus: 
         handle.config.max_seq_len = 131072
     end
     stdlib.free(config_path)
+    C.printf("Model config: hidden=%d, layers=%d, heads=%d, vocab=%d\n", handle.config.hidden_dim, handle.config.num_layers, handle.config.num_heads, handle.config.vocab_size)
     var index_path = [&int8](stdlib.malloc(dir_len + 64))
     string_h.sprintf(index_path, "%s/model.safetensors.index.json", model_dir)
-    if parse_safetensors_index(index_path, &handle.index) < 0 then
-        stdlib.free(index_path)
-        stdlib.free(handle.model_dir)
-        stdlib.free(handle)
-        return nil
-    end
+    var has_weights = parse_safetensors_index(index_path, &handle.index) == 0
     stdlib.free(index_path)
-    if load_shard_mappings(model_dir, &handle.index, &handle.shard_mappings) < 0 then
-        stdlib.free(handle.model_dir)
-        stdlib.free(handle)
-        return nil
-    end
-    handle.num_tensors = 0
-    handle.tensor_descriptors = nil
-    for i = 0, handle.index.num_shards do
-        var mapping = &handle.shard_mappings[i]
-        var shard_descriptors: &TensorDescriptor = nil
-        var num_shard_tensors: int32 = 0
-        if parse_safetensors_header(mapping.mmap_ptr, mapping.mmap_size, &shard_descriptors, &num_shard_tensors) == 0 then
-            var new_total = handle.num_tensors + num_shard_tensors
-            var new_descriptors = [&TensorDescriptor](stdlib.realloc(handle.tensor_descriptors, new_total * sizeof(TensorDescriptor)))
-            if new_descriptors ~= nil then
-                handle.tensor_descriptors = new_descriptors
-                for j = 0, num_shard_tensors do
-                    handle.tensor_descriptors[handle.num_tensors + j] = shard_descriptors[j]
-                    handle.tensor_descriptors[handle.num_tensors + j].shard_file = handle.index.shard_files[i]
+    if has_weights then
+        C.printf("Found %d weights in %d shards\n", handle.index.num_weights, handle.index.num_shards)
+        if load_shard_mappings(model_dir, &handle.index, &handle.shard_mappings) < 0 then
+            C.printf("Warning: Failed to load shard mappings\n")
+            has_weights = false
+        else
+            handle.num_tensors = 0
+            handle.tensor_descriptors = nil
+            for i = 0, handle.index.num_shards do
+                var mapping = &handle.shard_mappings[i]
+                var shard_descriptors: &TensorDescriptor = nil
+                var num_shard_tensors: int32 = 0
+                if parse_safetensors_header(mapping.mmap_ptr, mapping.mmap_size, &shard_descriptors, &num_shard_tensors) == 0 then
+                    var new_total = handle.num_tensors + num_shard_tensors
+                    var new_descriptors = [&TensorDescriptor](stdlib.realloc(handle.tensor_descriptors, new_total * sizeof(TensorDescriptor)))
+                    if new_descriptors ~= nil then
+                        handle.tensor_descriptors = new_descriptors
+                        for j = 0, num_shard_tensors do
+                            handle.tensor_descriptors[handle.num_tensors + j] = shard_descriptors[j]
+                            handle.tensor_descriptors[handle.num_tensors + j].shard_file = handle.index.shard_files[i]
+                        end
+                        handle.num_tensors = new_total
+                    end
+                    stdlib.free(shard_descriptors)
                 end
-                handle.num_tensors = new_total
             end
-            stdlib.free(shard_descriptors)
+            C.printf("Parsed %d tensor descriptors\n", handle.num_tensors)
         end
+    else
+        C.printf("No weight index found, running without model weights\n")
     end
     if init_cuda_contexts(handle) < 0 then
-        stdlib.free(handle.model_dir)
-        stdlib.free(handle)
-        return nil
+        C.printf("CUDA initialization failed, running in CPU mode\n")
+        handle.use_gpu = 0
     end
-    if init_nccl_contexts(handle) < 0 then
-        stdlib.free(handle.model_dir)
-        stdlib.free(handle)
-        return nil
+    if handle.use_gpu == 1 then
+        init_nccl_contexts(handle)
     end
     if init_paged_kv_cache(handle) < 0 then
+        C.printf("Failed to initialize KV cache\n")
         stdlib.free(handle.model_dir)
         stdlib.free(handle)
         return nil
     end
     if init_batch_state(handle) < 0 then
+        C.printf("Failed to initialize batch state\n")
+        stdlib.free(handle.model_dir)
+        stdlib.free(handle)
+        return nil
+    end
+    if has_weights then
+        if load_weights_to_gpu(handle) < 0 then
+            C.printf("Warning: Failed to load weights to GPU\n")
+        end
+    end
+    if allocate_inference_buffers(handle) < 0 then
+        C.printf("Failed to allocate inference buffers\n")
         stdlib.free(handle.model_dir)
         stdlib.free(handle)
         return nil
     end
     handle.initialized = 1
+    C.printf("Engine initialized successfully (GPU mode: %d)\n", handle.use_gpu)
     return handle
 end
 
@@ -1232,6 +1436,7 @@ end
 
 terra free_engine(handle: &EngineHandle) : void
     if handle == nil then return end
+    C.printf("Freeing engine resources...\n")
     if handle.model_dir ~= nil then
         stdlib.free(handle.model_dir)
     end
@@ -1242,8 +1447,13 @@ terra free_engine(handle: &EngineHandle) : void
         if handle.kv_cache.free_pages ~= nil then
             stdlib.free(handle.kv_cache.free_pages)
         end
-        cuda_free(handle.kv_cache.k_cache)
-        cuda_free(handle.kv_cache.v_cache)
+        if handle.use_gpu == 1 then
+            cw.cwFree(handle.kv_cache.k_cache)
+            cw.cwFree(handle.kv_cache.v_cache)
+        else
+            stdlib.free([&opaque](handle.kv_cache.k_cache))
+            stdlib.free([&opaque](handle.kv_cache.v_cache))
+        end
         pthread.pthread_mutex_destroy(&handle.kv_cache.lock)
         stdlib.free(handle.kv_cache)
     end
@@ -1260,15 +1470,36 @@ terra free_engine(handle: &EngineHandle) : void
         pthread.pthread_mutex_destroy(&handle.batch_state.lock)
         stdlib.free(handle.batch_state)
     end
-    if handle.cuda_contexts ~= nil then
+    if handle.cuda_contexts ~= nil and handle.use_gpu == 1 then
         for i = 0, handle.num_gpus do
-            cuda_free(handle.cuda_contexts[i].device_memory)
-            cuda_free(handle.cuda_contexts[i].workspace)
+            cbw.cbwDestroy(handle.cuda_contexts[i].cublas_handle)
+            cbw.cbwLtDestroy(handle.cuda_contexts[i].cublaslt_handle)
+            cw.cwFree(handle.cuda_contexts[i].device_memory)
+            cw.cwFree(handle.cuda_contexts[i].workspace)
+            cw.cwStreamDestroy(handle.cuda_contexts[i].stream)
         end
         stdlib.free(handle.cuda_contexts)
     end
     if handle.nccl_contexts ~= nil then
         stdlib.free(handle.nccl_contexts)
+    end
+    if handle.use_gpu == 1 then
+        if handle.embed_weight ~= 0 then cw.cwFree(handle.embed_weight) end
+        if handle.lm_head_weight ~= 0 then cw.cwFree(handle.lm_head_weight) end
+        if handle.final_norm ~= 0 then cw.cwFree(handle.final_norm) end
+        if handle.hidden_buffer ~= 0 then cw.cwFree(handle.hidden_buffer) end
+        if handle.residual_buffer ~= 0 then cw.cwFree(handle.residual_buffer) end
+        if handle.qkv_buffer ~= 0 then cw.cwFree(handle.qkv_buffer) end
+        if handle.attn_out_buffer ~= 0 then cw.cwFree(handle.attn_out_buffer) end
+        if handle.mlp_buffer ~= 0 then cw.cwFree(handle.mlp_buffer) end
+        if handle.logits_buffer ~= 0 then cw.cwFree(handle.logits_buffer) end
+    else
+        if handle.hidden_buffer ~= 0 then stdlib.free([&opaque](handle.hidden_buffer)) end
+        if handle.residual_buffer ~= 0 then stdlib.free([&opaque](handle.residual_buffer)) end
+        if handle.qkv_buffer ~= 0 then stdlib.free([&opaque](handle.qkv_buffer)) end
+        if handle.attn_out_buffer ~= 0 then stdlib.free([&opaque](handle.attn_out_buffer)) end
+        if handle.mlp_buffer ~= 0 then stdlib.free([&opaque](handle.mlp_buffer)) end
+        if handle.logits_buffer ~= 0 then stdlib.free([&opaque](handle.logits_buffer)) end
     end
     if handle.shard_mappings ~= nil then
         for i = 0, handle.index.num_shards do
@@ -1315,6 +1546,7 @@ terra free_engine(handle: &EngineHandle) : void
         stdlib.free(handle.layer_weights)
     end
     stdlib.free(handle)
+    C.printf("Engine freed\n")
 end
 
 terra get_engine_info(handle: &EngineHandle, info_type: int32) : int64
@@ -1332,6 +1564,7 @@ terra get_engine_info(handle: &EngineHandle, info_type: int32) : int64
     if info_type == 10 then return handle.kv_cache.max_pages end
     if info_type == 11 then return handle.batch_state.num_requests end
     if info_type == 12 then return handle.num_tensors end
+    if info_type == 13 then return handle.use_gpu end
     return -1
 end
 

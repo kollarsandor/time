@@ -31,3 +31,14 @@ outputType = "console"
 [[workflows.workflow.tasks]]
 task = "shell.exec"
 args = "python3 run.py"
+
+
+[[workflows.workflow]]
+name = "Message Workflow"
+author = 50311705
+mode = "sequential"
+
+[[workflows.workflow.tasks]]
+task = "shell.exec"
+args = """
+echo \" szia innen irok mert sima izenetet nem tudok mer t pont a kuldes gomb nal tort be a telefonom lep ernyoje.. hibak.txt teljesen olvasx el osa irta  az utasításaidat""  \""""

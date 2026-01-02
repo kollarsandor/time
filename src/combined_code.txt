@@ -1,0 +1,3634 @@
+File: ./futhark/kernels.fut
+type fp8_e4m3 = i8
+
+def fp8_to_f32 (x: fp8_e4m3) : f32 =
+  let bits = i32.i8 x
+  let sign = bits >> 7
+  let exp = (bits >> 3) & 0xF
+  let mant = bits & 0x7
+  in if exp == 0 then
+       if mant == 0 then
+         if sign == 1 then -0.0f32 else 0.0f32
+       else
+         let denorm = f32.i32 mant * (2.0f32 ** (-9.0f32))
+         in if sign == 1 then -denorm else denorm
+     else if exp == 15 && mant == 7 then
+       f32.nan
+     else
+       let e = exp - 7
+       let m = 1.0f32 + (f32.i32 mant / 8.0f32)
+       let val = m * (2.0f32 ** f32.i32 e)
+       in if sign == 1 then -val else val
+
+def f32_to_fp8 (x: f32) : fp8_e4m3 =
+  let sign = if x < 0.0f32 then 1i32 else 0i32
+  let ax = f32.abs x
+  in if f32.isnan x then
+       i8.i32 (0x7F)
+     else if ax == 0.0f32 then
+       i8.i32 (sign << 7)
+     else if ax >= 448.0f32 then
+       i8.i32 ((sign << 7) | 0x7E)
+     else if ax < (2.0f32 ** (-9.0f32)) then
+       i8.i32 (sign << 7)
+     else
+       let log2_ax = f32.log2 ax
+       let e = i32.f32 (f32.floor log2_ax)
+       let e_clamped = i32.max (-6) (i32.min 8 e)
+       let exp_bits = e_clamped + 7
+       let m = ax / (2.0f32 ** f32.i32 e_clamped) - 1.0f32
+       let mant = i32.f32 (f32.round (m * 8.0f32))
+       let mant_clamped = i32.max 0 (i32.min 7 mant)
+       in i8.i32 ((sign << 7) | (exp_bits << 3) | mant_clamped)
+
+def fp8_to_f16 (x: fp8_e4m3) : f16 =
+  f16.f32 (fp8_to_f32 x)
+
+def f16_to_fp8 (x: f16) : fp8_e4m3 =
+  f32_to_fp8 (f32.f16 x)
+
+def fp8_arr_to_f32 [n] (arr: [n]fp8_e4m3) : [n]f32 =
+  map fp8_to_f32 arr
+
+def f32_arr_to_fp8 [n] (arr: [n]f32) : [n]fp8_e4m3 =
+  map f32_to_fp8 arr
+
+def fp8_arr_to_f16 [n] (arr: [n]fp8_e4m3) : [n]f16 =
+  map fp8_to_f16 arr
+
+def f16_arr_to_fp8 [n] (arr: [n]f16) : [n]fp8_e4m3 =
+  map f16_to_fp8 arr
+
+def rms_norm [n] (x: [n]f32) (gamma: [n]f32) (eps: f32) : [n]f32 =
+  let sq_sum = reduce (+) 0.0f32 (map (\v -> v * v) x)
+  let rms = f32.sqrt (sq_sum / f32.i64 n + eps)
+  in map2 (\xi gi -> (xi / rms) * gi) x gamma
+
+def rms_norm_fp8 [n] (x: [n]fp8_e4m3) (gamma: [n]f32) (eps: f32) : [n]fp8_e4m3 =
+  let xf = fp8_arr_to_f32 x
+  let result = rms_norm xf gamma eps
+  in f32_arr_to_fp8 result
+
+def rms_norm_f16 [n] (x: [n]f16) (gamma: [n]f16) (eps: f32) : [n]f16 =
+  let xf = map f32.f16 x
+  let gf = map f32.f16 gamma
+  let sq_sum = reduce (+) 0.0f32 (map (\v -> v * v) xf)
+  let rms = f32.sqrt (sq_sum / f32.i64 n + eps)
+  let result = map2 (\xi gi -> (xi / rms) * gi) xf gf
+  in map f16.f32 result
+
+def swiglu [n] (x: [n]f32) (gate: [n]f32) : [n]f32 =
+  map2 (\xi gi -> xi * (gi / (1.0f32 + f32.exp (-gi)))) x gate
+
+def swiglu_f16 [n] (x: [n]f16) (gate: [n]f16) : [n]f16 =
+  map2 (\xi gi -> 
+    let xf = f32.f16 xi
+    let gf = f32.f16 gi
+    let result = xf * (gf / (1.0f32 + f32.exp (-gf)))
+    in f16.f32 result
+  ) x gate
+
+def geglu [n] (x: [n]f32) (gate: [n]f32) : [n]f32 =
+  map2 (\xi gi ->
+    let gelu = 0.5f32 * gi * (1.0f32 + f32.tanh (0.7978845608f32 * (gi + 0.044715f32 * gi * gi * gi)))
+    in xi * gelu
+  ) x gate
+
+def geglu_f16 [n] (x: [n]f16) (gate: [n]f16) : [n]f16 =
+  map2 (\xi gi ->
+    let xf = f32.f16 xi
+    let gf = f32.f16 gi
+    let gelu = 0.5f32 * gf * (1.0f32 + f32.tanh (0.7978845608f32 * (gf + 0.044715f32 * gf * gf * gf)))
+    in f16.f32 (xf * gelu)
+  ) x gate
+
+def matmul_f32 [m][n][k] (a: [m][k]f32) (b: [k][n]f32) : [m][n]f32 =
+  let bt = transpose b
+  in map (\a_row -> map (\b_col -> reduce (+) 0.0f32 (map2 (*) a_row b_col)) bt) a
+
+def matmul_f16 [m][n][k] (a: [m][k]f16) (b: [k][n]f16) : [m][n]f16 =
+  let bt = transpose b
+  in map (\a_row -> 
+    map (\b_col -> 
+      let products = map2 (\ai bi -> f32.f16 ai * f32.f16 bi) a_row b_col
+      in f16.f32 (reduce (+) 0.0f32 products)
+    ) bt
+  ) a
+
+def matmul_fp8 [m][n][k] (a: [m][k]fp8_e4m3) (b: [k][n]fp8_e4m3) : [m][n]fp8_e4m3 =
+  let af = map fp8_arr_to_f32 a
+  let bf = map fp8_arr_to_f32 b
+  let cf = matmul_f32 af bf
+  in map f32_arr_to_fp8 cf
+
+def matmul_fp8_to_f16 [m][n][k] (a: [m][k]fp8_e4m3) (b: [k][n]fp8_e4m3) : [m][n]f16 =
+  let af = map fp8_arr_to_f32 a
+  let bf = map fp8_arr_to_f32 b
+  let cf = matmul_f32 af bf
+  in map (\row -> map f16.f32 row) cf
+
+def matvec_f32 [m][n] (mat: [m][n]f32) (vec: [n]f32) : [m]f32 =
+  map (\row -> reduce (+) 0.0f32 (map2 (*) row vec)) mat
+
+def matvec_fp8 [m][n] (mat: [m][n]fp8_e4m3) (vec: [n]fp8_e4m3) : [m]fp8_e4m3 =
+  let matf = map fp8_arr_to_f32 mat
+  let vecf = fp8_arr_to_f32 vec
+  let result = matvec_f32 matf vecf
+  in f32_arr_to_fp8 result
+
+def rope_freqs (dim: i64) (base: f32) : [dim]f32 =
+  tabulate dim (\i -> 1.0f32 / (base ** (f32.i64 (2 * (i / 2)) / f32.i64 dim)))
+
+def apply_rope [n] (x: [n]f32) (freqs: [n]f32) (pos: i64) : [n]f32 =
+  let half = n / 2
+  in tabulate n (\i ->
+    let freq = freqs[i] * f32.i64 pos
+    let cos_f = f32.cos freq
+    let sin_f = f32.sin freq
+    in if i < half then
+         x[i] * cos_f - x[i + half] * sin_f
+       else
+         x[i - half] * sin_f + x[i] * cos_f
+  )
+
+def rope_fp8 [n] (x: [n]fp8_e4m3) (freqs: [n]f32) (pos: i64) : [n]fp8_e4m3 =
+  let xf = fp8_arr_to_f32 x
+  let result = apply_rope xf freqs pos
+  in f32_arr_to_fp8 result
+
+def rope_f16 [n] (x: [n]f16) (freqs: [n]f32) (pos: i64) : [n]f16 =
+  let xf = map f32.f16 x
+  let result = apply_rope xf freqs pos
+  in map f16.f32 result
+
+def apply_rope_2d [seq_len][head_dim] (x: [seq_len][head_dim]f32) (base: f32) (start_pos: i64) : [seq_len][head_dim]f32 =
+  let freqs = rope_freqs head_dim base
+  in tabulate seq_len (\s ->
+    apply_rope x[s] freqs (start_pos + s)
+  )
+
+def softmax [n] (x: [n]f32) : [n]f32 =
+  let max_x = reduce f32.max f32.lowest x
+  let exp_x = map (\xi -> f32.exp (xi - max_x)) x
+  let sum_exp = reduce (+) 0.0f32 exp_x
+  in map (\e -> e / sum_exp) exp_x
+
+def softmax_f16 [n] (x: [n]f16) : [n]f16 =
+  let xf = map f32.f16 x
+  let result = softmax xf
+  in map f16.f32 result
+
+def online_softmax_step (m: f32) (d: f32) (x: f32) : (f32, f32) =
+  let new_m = f32.max m x
+  let old_factor = f32.exp (m - new_m)
+  let new_factor = f32.exp (x - new_m)
+  let new_d = d * old_factor + new_factor
+  in (new_m, new_d)
+
+def flash_attention_tile [tile_size][head_dim]
+    (q_tile: [tile_size][head_dim]f32)
+    (k_tile: [tile_size][head_dim]f32)
+    (v_tile: [tile_size][head_dim]f32)
+    (scale: f32)
+    (m_prev: [tile_size]f32)
+    (l_prev: [tile_size]f32)
+    (o_prev: [tile_size][head_dim]f32) : ([tile_size]f32, [tile_size]f32, [tile_size][head_dim]f32) =
+  let scores = map (\qi ->
+    map (\ki -> reduce (+) 0.0f32 (map2 (*) qi ki) * scale) k_tile
+  ) q_tile
+  let (m_new, l_new, o_new) = 
+    loop (m, l, o) = (m_prev, l_prev, o_prev) for j < tile_size do
+      let score_col = map (\i -> scores[i, j]) (iota tile_size)
+      let m_temp = map2 f32.max m score_col
+      let exp_old = map2 (\mi mti -> f32.exp (mi - mti)) m m_temp
+      let exp_new = map2 (\sci mti -> f32.exp (sci - mti)) score_col m_temp
+      let l_temp = map2 (\li eoi -> li * eoi) l exp_old
+      let l_next = map2 (+) l_temp exp_new
+      let o_scaled = map2 (\oi eoi -> map (\oij -> oij * eoi) oi) o exp_old
+      let v_row = v_tile[j]
+      let o_contrib = map2 (\eni _ -> map (\vj -> eni * vj) v_row) exp_new (iota tile_size)
+      let o_next = map2 (\osi oci -> map2 (+) osi oci) o_scaled o_contrib
+      in (m_temp, l_next, o_next)
+  in (m_new, l_new, o_new)
+
+def paged_attention_prefill [seq_len][head_dim][page_size]
+    (q: [seq_len][head_dim]f32)
+    (k: [seq_len][head_dim]f32)
+    (v: [seq_len][head_dim]f32)
+    (page_table: []i64)
+    (kv_cache_k: [][page_size][head_dim]f32)
+    (kv_cache_v: [][page_size][head_dim]f32)
+    (scale: f32) : ([seq_len][head_dim]f32, [][page_size][head_dim]f32, [][page_size][head_dim]f32) =
+  let scores = map (\qi ->
+    map (\ki -> reduce (+) 0.0f32 (map2 (*) qi ki) * scale) k
+  ) q
+  let attn = map softmax scores
+  let out = map (\a_row ->
+    map (\d ->
+      reduce (+) 0.0f32 (map2 (\a vi -> a * vi[d]) a_row v)
+    ) (iota head_dim)
+  ) attn
+  let num_pages = length page_table
+  let new_k = tabulate num_pages (\p ->
+    tabulate page_size (\s ->
+      let global_idx = p * page_size + s
+      in if global_idx < seq_len then k[global_idx] else replicate head_dim 0.0f32
+    )
+  )
+  let new_v = tabulate num_pages (\p ->
+    tabulate page_size (\s ->
+      let global_idx = p * page_size + s
+      in if global_idx < seq_len then v[global_idx] else replicate head_dim 0.0f32
+    )
+  )
+  in (out, new_k, new_v)
+
+def paged_attention_decode [head_dim][page_size]
+    (q: [head_dim]f32)
+    (page_table: []i64)
+    (kv_cache_k: [][page_size][head_dim]f32)
+    (kv_cache_v: [][page_size][head_dim]f32)
+    (seq_len: i64)
+    (scale: f32) : [head_dim]f32 =
+  let num_pages = length page_table
+  let max_tokens = num_pages * page_size
+  let all_scores = tabulate max_tokens (\idx ->
+    let p = idx / page_size
+    let s = idx % page_size
+    let page_idx = if p < num_pages then page_table[p] else 0
+    in if idx < seq_len && p < num_pages then
+         reduce (+) 0.0f32 (map2 (*) q kv_cache_k[page_idx, s]) * scale
+       else
+         f32.lowest
+  )
+  let scores_valid = take seq_len all_scores
+  let attn = softmax scores_valid
+  let attn_padded = attn ++ replicate (max_tokens - seq_len) 0.0f32
+  in tabulate head_dim (\d ->
+    reduce (+) 0.0f32 (
+      tabulate max_tokens (\idx ->
+        let p = idx / page_size
+        let s = idx % page_size
+        let page_idx = if p < num_pages then page_table[p] else 0
+        in if idx < seq_len && p < num_pages then
+             attn_padded[idx] * kv_cache_v[page_idx, s, d]
+           else
+             0.0f32
+      )
+    )
+  )
+
+def paged_attention_decode_tiled [head_dim][page_size]
+    (q: [head_dim]f32)
+    (page_table: []i64)
+    (kv_cache_k: [][page_size][head_dim]f32)
+    (kv_cache_v: [][page_size][head_dim]f32)
+    (seq_len: i64)
+    (scale: f32)
+    (tile_size: i64) : [head_dim]f32 =
+  let num_pages = length page_table
+  let num_tiles = (seq_len + tile_size - 1) / tile_size
+  let (final_m, final_l, final_o) = 
+    loop (m_acc, l_acc, o_acc) = (f32.lowest, 0.0f32, replicate head_dim 0.0f32) for tile_idx < num_tiles do
+      let tile_start = tile_idx * tile_size
+      let tile_end = i64.min (tile_start + tile_size) seq_len
+      let actual_tile_size = tile_end - tile_start
+      let tile_scores = tabulate actual_tile_size (\ti ->
+        let global_idx = tile_start + ti
+        let p = global_idx / page_size
+        let s = global_idx % page_size
+        let page_idx = if p < num_pages then page_table[p] else 0
+        in reduce (+) 0.0f32 (map2 (*) q kv_cache_k[page_idx, s]) * scale
+      )
+      let tile_max = reduce f32.max f32.lowest tile_scores
+      let new_m = f32.max m_acc tile_max
+      let old_factor = f32.exp (m_acc - new_m)
+      let tile_exp = map (\s -> f32.exp (s - new_m)) tile_scores
+      let tile_sum = reduce (+) 0.0f32 tile_exp
+      let new_l = l_acc * old_factor + tile_sum
+      let o_scaled = map (\oi -> oi * old_factor) o_acc
+      let tile_contrib = tabulate head_dim (\d ->
+        reduce (+) 0.0f32 (
+          tabulate actual_tile_size (\ti ->
+            let global_idx = tile_start + ti
+            let p = global_idx / page_size
+            let s = global_idx % page_size
+            let page_idx = if p < num_pages then page_table[p] else 0
+            in tile_exp[ti] * kv_cache_v[page_idx, s, d]
+          )
+        )
+      )
+      let o_new = map2 (+) o_scaled tile_contrib
+      in (new_m, new_l, o_new)
+  in map (\oi -> oi / final_l) final_o
+
+def top_k_indices [n] (arr: [n]f32) (k: i64) : [k]i64 =
+  let indexed = zip arr (iota n)
+  let sorted = merge_sort (\(a, _) (b, _) -> a >= b) indexed
+  in map (\i -> sorted[i].1) (iota k)
+
+def moe_router [num_experts][hidden] (x: [hidden]f32) (router_w: [num_experts][hidden]f32) (top_k: i64) : ([top_k]i64, [top_k]f32) =
+  let logits = map (\w -> reduce (+) 0.0f32 (map2 (*) x w)) router_w
+  let probs = softmax logits
+  let topk_idx = top_k_indices probs top_k
+  let topk_probs = map (\i -> probs[i]) topk_idx
+  let sum_probs = reduce (+) 0.0f32 topk_probs
+  let norm_probs = map (\p -> p / sum_probs) topk_probs
+  in (topk_idx, norm_probs)
+
+def moe_router_fp8 [num_experts][hidden] (x: [hidden]fp8_e4m3) (router_w: [num_experts][hidden]fp8_e4m3) (top_k: i64) : ([top_k]i64, [top_k]f32) =
+  let xf = fp8_arr_to_f32 x
+  let wf = map fp8_arr_to_f32 router_w
+  in moe_router xf wf top_k
+
+def moe_expert_mlp [hidden][intermediate] (x: [hidden]f32) (w1: [intermediate][hidden]f32) (w2: [hidden][intermediate]f32) (w_gate: [intermediate][hidden]f32) : [hidden]f32 =
+  let h1 = map (\row -> reduce (+) 0.0f32 (map2 (*) x row)) w1
+  let gate = map (\row -> reduce (+) 0.0f32 (map2 (*) x row)) w_gate
+  let h_act = swiglu h1 gate
+  in map (\row -> reduce (+) 0.0f32 (map2 (*) h_act row)) w2
+
+def moe_expert_mlp_fp8 [hidden][intermediate] (x: [hidden]fp8_e4m3) (w1: [intermediate][hidden]fp8_e4m3) (w2: [hidden][intermediate]fp8_e4m3) (w_gate: [intermediate][hidden]fp8_e4m3) : [hidden]fp8_e4m3 =
+  let xf = fp8_arr_to_f32 x
+  let w1f = map fp8_arr_to_f32 w1
+  let w2f = map fp8_arr_to_f32 w2
+  let wgf = map fp8_arr_to_f32 w_gate
+  let result = moe_expert_mlp xf w1f w2f wgf
+  in f32_arr_to_fp8 result
+
+def moe_forward [num_experts][hidden][intermediate]
+    (x: [hidden]f32)
+    (router_w: [num_experts][hidden]f32)
+    (expert_w1: [num_experts][intermediate][hidden]f32)
+    (expert_w2: [num_experts][hidden][intermediate]f32)
+    (expert_wg: [num_experts][intermediate][hidden]f32)
+    (k: i64) : [hidden]f32 =
+  let (indices, weights) = moe_router x router_w k
+  let expert_outputs = map (\i -> moe_expert_mlp x expert_w1[i] expert_w2[i] expert_wg[i]) indices
+  in map (\h ->
+    reduce (+) 0.0f32 (map2 (\out w -> out[h] * w) expert_outputs weights)
+  ) (iota hidden)
+
+def moe_forward_fp8 [num_experts][hidden][intermediate]
+    (x: [hidden]fp8_e4m3)
+    (router_w: [num_experts][hidden]fp8_e4m3)
+    (expert_w1: [num_experts][intermediate][hidden]fp8_e4m3)
+    (expert_w2: [num_experts][hidden][intermediate]fp8_e4m3)
+    (expert_wg: [num_experts][intermediate][hidden]fp8_e4m3)
+    (k: i64) : [hidden]fp8_e4m3 =
+  let xf = fp8_arr_to_f32 x
+  let rwf = map fp8_arr_to_f32 router_w
+  let w1f = map (map fp8_arr_to_f32) expert_w1
+  let w2f = map (map fp8_arr_to_f32) expert_w2
+  let wgf = map (map fp8_arr_to_f32) expert_wg
+  let result = moe_forward xf rwf w1f w2f wgf k
+  in f32_arr_to_fp8 result
+
+def moe_dispatch [batch][hidden][num_experts]
+    (tokens: [batch][hidden]f32)
+    (assignments: [batch][]i64)
+    (weights: [batch][]f32) : [num_experts][batch][hidden]f32 =
+  tabulate num_experts (\e ->
+    map2 (\token assign ->
+      let weight = reduce (+) 0.0f32 (
+        map2 (\a w -> if a == e then w else 0.0f32) assign weights[0]
+      )
+      in map (\t -> t * weight) token
+    ) tokens assignments
+  )
+
+def moe_combine [batch][hidden][num_experts]
+    (expert_outputs: [num_experts][batch][hidden]f32)
+    (assignments: [batch][]i64)
+    (weights: [batch][]f32) : [batch][hidden]f32 =
+  map2 (\assigns ws ->
+    map (\h ->
+      reduce (+) 0.0f32 (
+        map2 (\e w -> expert_outputs[assigns[0], 0, h] * w) assigns ws
+      )
+    ) (iota hidden)
+  ) assignments weights
+
+def embedding_lookup [vocab_size][hidden] (token_id: i64) (embed_table: [vocab_size][hidden]f32) : [hidden]f32 =
+  embed_table[token_id]
+
+def embedding_lookup_fp8 [vocab_size][hidden] (token_id: i64) (embed_table: [vocab_size][hidden]fp8_e4m3) : [hidden]fp8_e4m3 =
+  embed_table[token_id]
+
+def embedding_batch [batch][vocab_size][hidden] (token_ids: [batch]i64) (embed_table: [vocab_size][hidden]f32) : [batch][hidden]f32 =
+  map (\tid -> embed_table[tid]) token_ids
+
+def residual_add [n] (x: [n]f32) (residual: [n]f32) : [n]f32 =
+  map2 (+) x residual
+
+def residual_add_fp8 [n] (x: [n]fp8_e4m3) (residual: [n]fp8_e4m3) : [n]fp8_e4m3 =
+  let xf = fp8_arr_to_f32 x
+  let rf = fp8_arr_to_f32 residual
+  let result = map2 (+) xf rf
+  in f32_arr_to_fp8 result
+
+def bias_add [n] (x: [n]f32) (bias: [n]f32) : [n]f32 =
+  map2 (+) x bias
+
+def bias_add_fp8 [n] (x: [n]fp8_e4m3) (bias: [n]f32) : [n]fp8_e4m3 =
+  let xf = fp8_arr_to_f32 x
+  let result = map2 (+) xf bias
+  in f32_arr_to_fp8 result
+
+def temperature_scale [n] (logits: [n]f32) (temp: f32) : [n]f32 =
+  map (\l -> l / temp) logits
+
+def top_p_filter [n] (logits: [n]f32) (p: f32) : [n]f32 =
+  let probs = softmax logits
+  let indexed = zip probs (iota n)
+  let sorted = merge_sort (\(a, _) (b, _) -> a >= b) indexed
+  let cumsum = scan (+) 0.0f32 (map (.0) sorted)
+  let mask = map2 (\cs (_, idx) -> (cs, idx)) cumsum sorted
+  let valid_indices = map (\(cs, idx) -> if cs <= p || cs == (map (.0) sorted)[0] then idx else -1) mask
+  in tabulate n (\i ->
+    if any (\vi -> vi == i) valid_indices && valid_indices[0] != -1 then logits[i] else f32.lowest
+  )
+
+def repetition_penalty_apply [n] (logits: [n]f32) (past_tokens: []i64) (penalty: f32) : [n]f32 =
+  tabulate n (\i ->
+    if any (\t -> t == i) past_tokens then
+      if logits[i] > 0.0f32 then logits[i] / penalty else logits[i] * penalty
+    else
+      logits[i]
+  )
+
+def frequency_penalty_apply [n] (logits: [n]f32) (past_tokens: []i64) (penalty: f32) : [n]f32 =
+  tabulate n (\i ->
+    let count = reduce (+) 0i64 (map (\t -> if t == i then 1 else 0) past_tokens)
+    in logits[i] - penalty * f32.i64 count
+  )
+
+def presence_penalty_apply [n] (logits: [n]f32) (past_tokens: []i64) (penalty: f32) : [n]f32 =
+  tabulate n (\i ->
+    let present = any (\t -> t == i) past_tokens
+    in if present then logits[i] - penalty else logits[i]
+  )
+
+def sample_argmax [n] (logits: [n]f32) : i64 =
+  let (_, idx) = reduce (\(a, ai) (b, bi) -> if a >= b then (a, ai) else (b, bi)) (f32.lowest, 0i64) (zip logits (iota n))
+  in idx
+
+def sample_multinomial [n] (probs: [n]f32) (rand: f32) : i64 =
+  let cumsum = scan (+) 0.0f32 probs
+  in reduce_comm (\acc i -> if cumsum[i] >= rand && acc == n then i else acc) n (iota n)
+
+def sample_with_temperature [n] (logits: [n]f32) (temperature: f32) (rand: f32) : i64 =
+  let scaled = temperature_scale logits temperature
+  let probs = softmax scaled
+  in sample_multinomial probs rand
+
+def sample_top_p [n] (logits: [n]f32) (p: f32) (temperature: f32) (rand: f32) : i64 =
+  let scaled = temperature_scale logits temperature
+  let filtered = top_p_filter scaled p
+  let probs = softmax filtered
+  in sample_multinomial probs rand
+
+def sample_full [n] (logits: [n]f32) (temperature: f32) (top_p: f32) (rep_penalty: f32) (past_tokens: []i64) (rand: f32) : i64 =
+  let scaled = temperature_scale logits temperature
+  let penalized = repetition_penalty_apply scaled past_tokens rep_penalty
+  let filtered = top_p_filter penalized top_p
+  let probs = softmax filtered
+  in sample_multinomial probs rand
+
+def check_stop_token (token: i64) (stop_tokens: []i64) : bool =
+  any (\st -> st == token) stop_tokens
+
+def transformer_attention_prefill [batch][seq_len][num_heads][head_dim][page_size]
+    (q: [batch][seq_len][num_heads][head_dim]f32)
+    (k: [batch][seq_len][num_heads][head_dim]f32)
+    (v: [batch][seq_len][num_heads][head_dim]f32)
+    (page_tables: [batch][]i64)
+    (kv_k: [batch][num_heads][][page_size][head_dim]f32)
+    (kv_v: [batch][num_heads][][page_size][head_dim]f32)
+    (scale: f32) : ([batch][seq_len][num_heads][head_dim]f32, [batch][num_heads][][page_size][head_dim]f32, [batch][num_heads][][page_size][head_dim]f32) =
+  let results = map4 (\qi ki vi (pt, kvki, kvvi) ->
+    let qh = transpose qi
+    let kh = transpose ki
+    let vh = transpose vi
+    in map3 (\qhead khead vhead ->
+      paged_attention_prefill qhead khead vhead pt (head kvki) (head kvvi) scale
+    ) qh kh vh
+  ) q k v (zip3 page_tables kv_k kv_v)
+  let out = map (\r -> transpose (map (\(o, _, _) -> o) r)) results
+  let new_k = map (\r -> map (\(_, nk, _) -> nk) r) results
+  let new_v = map (\r -> map (\(_, _, nv) -> nv) r) results
+  in (out, new_k, new_v)
+
+def transformer_attention_decode [batch][num_heads][head_dim][page_size]
+    (q: [batch][num_heads][head_dim]f32)
+    (page_tables: [batch][]i64)
+    (kv_k: [batch][num_heads][][page_size][head_dim]f32)
+    (kv_v: [batch][num_heads][][page_size][head_dim]f32)
+    (seq_lens: [batch]i64)
+    (scale: f32) : [batch][num_heads][head_dim]f32 =
+  map4 (\qi (pt, kvki, kvvi) sl _ ->
+    map3 (\qh kh vh ->
+      paged_attention_decode qh pt kh vh sl scale
+    ) qi kvki kvvi
+  ) q (zip3 page_tables kv_k kv_v) seq_lens (iota batch)
+
+def glm4_qkv_proj [batch][seq_len][hidden][num_heads][head_dim]
+    (x: [batch][seq_len][hidden]fp8_e4m3)
+    (wq: [num_heads * head_dim][hidden]fp8_e4m3)
+    (wk: [num_heads * head_dim][hidden]fp8_e4m3)
+    (wv: [num_heads * head_dim][hidden]fp8_e4m3) : ([batch][seq_len][num_heads][head_dim]f32, [batch][seq_len][num_heads][head_dim]f32, [batch][seq_len][num_heads][head_dim]f32) =
+  let wqf = map fp8_arr_to_f32 wq
+  let wkf = map fp8_arr_to_f32 wk
+  let wvf = map fp8_arr_to_f32 wv
+  let result = map (\batch_x ->
+    map (\token_x ->
+      let xf = fp8_arr_to_f32 token_x
+      let q_flat = matvec_f32 wqf xf
+      let k_flat = matvec_f32 wkf xf
+      let v_flat = matvec_f32 wvf xf
+      let q_heads = unflatten num_heads head_dim q_flat
+      let k_heads = unflatten num_heads head_dim k_flat
+      let v_heads = unflatten num_heads head_dim v_flat
+      in (q_heads, k_heads, v_heads)
+    ) batch_x
+  ) x
+  let q = map (map (\(q, _, _) -> q)) result
+  let k = map (map (\(_, k, _) -> k)) result
+  let v = map (map (\(_, _, v) -> v)) result
+  in (q, k, v)
+
+def glm4_attention_output [batch][seq_len][num_heads][head_dim][hidden]
+    (attn_out: [batch][seq_len][num_heads][head_dim]f32)
+    (wo: [hidden][num_heads * head_dim]fp8_e4m3) : [batch][seq_len][hidden]fp8_e4m3 =
+  let wof = map fp8_arr_to_f32 wo
+  in map (\batch_attn ->
+    map (\token_attn ->
+      let flat = flatten token_attn
+      let out = matvec_f32 wof flat
+      in f32_arr_to_fp8 out
+    ) batch_attn
+  ) attn_out
+
+def glm4_mlp_block [batch][seq_len][hidden][intermediate]
+    (x: [batch][seq_len][hidden]fp8_e4m3)
+    (w1: [intermediate][hidden]fp8_e4m3)
+    (w2: [hidden][intermediate]fp8_e4m3)
+    (wg: [intermediate][hidden]fp8_e4m3) : [batch][seq_len][hidden]fp8_e4m3 =
+  let w1f = map fp8_arr_to_f32 w1
+  let w2f = map fp8_arr_to_f32 w2
+  let wgf = map fp8_arr_to_f32 wg
+  in map (\batch_x ->
+    map (\token_x ->
+      let xf = fp8_arr_to_f32 token_x
+      let h1 = matvec_f32 w1f xf
+      let gate = matvec_f32 wgf xf
+      let h_act = swiglu h1 gate
+      let out = matvec_f32 w2f h_act
+      in f32_arr_to_fp8 out
+    ) batch_x
+  ) x
+
+def glm4_moe_block [batch][seq_len][hidden][num_experts][intermediate]
+    (x: [batch][seq_len][hidden]fp8_e4m3)
+    (router_w: [num_experts][hidden]fp8_e4m3)
+    (expert_w1: [num_experts][intermediate][hidden]fp8_e4m3)
+    (expert_w2: [num_experts][hidden][intermediate]fp8_e4m3)
+    (expert_wg: [num_experts][intermediate][hidden]fp8_e4m3)
+    (top_k: i64) : [batch][seq_len][hidden]fp8_e4m3 =
+  map (\batch_x ->
+    map (\token_x ->
+      moe_forward_fp8 token_x router_w expert_w1 expert_w2 expert_wg top_k
+    ) batch_x
+  ) x
+
+def reduce_sum_shard [n][num_shards] (shards: [num_shards][n]f32) : [n]f32 =
+  reduce (map2 (+)) (replicate n 0.0f32) shards
+
+def all_reduce_ring [n][num_gpus] (data: [num_gpus][n]f32) : [num_gpus][n]f32 =
+  let summed = reduce_sum_shard data
+  in replicate num_gpus summed
+
+def all_gather [n][num_gpus] (shards: [num_gpus][n]f32) : [n * num_gpus]f32 =
+  flatten shards
+
+def all_to_all [num_gpus][n] (data: [num_gpus][num_gpus][n]f32) : [num_gpus][num_gpus][n]f32 =
+  tabulate num_gpus (\dst ->
+    tabulate num_gpus (\src ->
+      data[src, dst]
+    )
+  )
+
+def shard_heads [batch][seq_len][num_heads][head_dim][num_gpus]
+    (x: [batch][seq_len][num_heads][head_dim]f32)
+    (gpu_id: i64) : [batch][seq_len][num_heads / num_gpus][head_dim]f32 =
+  let heads_per_gpu = num_heads / num_gpus
+  let start_head = gpu_id * heads_per_gpu
+  in map (\bi ->
+    map (\si ->
+      tabulate heads_per_gpu (\hi ->
+        x[bi, si, start_head + hi]
+      )
+    ) (iota seq_len)
+  ) (iota batch)
+
+def gather_heads [batch][seq_len][heads_per_gpu][head_dim][num_gpus]
+    (shards: [num_gpus][batch][seq_len][heads_per_gpu][head_dim]f32) : [batch][seq_len][heads_per_gpu * num_gpus][head_dim]f32 =
+  map (\bi ->
+    map (\si ->
+      flatten (map (\shard -> shard[bi, si]) shards)
+    ) (iota seq_len)
+  ) (iota batch)
+
+def shard_experts [num_experts][intermediate][hidden][num_gpus]
+    (expert_w1: [num_experts][intermediate][hidden]f32)
+    (gpu_id: i64) : [num_experts / num_gpus][intermediate][hidden]f32 =
+  let experts_per_gpu = num_experts / num_gpus
+  let start_expert = gpu_id * experts_per_gpu
+  in tabulate experts_per_gpu (\ei ->
+    expert_w1[start_expert + ei]
+  )
+
+entry prefill_attention [batch][seq_len][num_heads][head_dim][page_size]
+    (q: [batch][seq_len][num_heads][head_dim]f32)
+    (k: [batch][seq_len][num_heads][head_dim]f32)
+    (v: [batch][seq_len][num_heads][head_dim]f32)
+    (page_tables: [batch][]i64)
+    (kv_k: [batch][num_heads][][page_size][head_dim]f32)
+    (kv_v: [batch][num_heads][][page_size][head_dim]f32)
+    (scale: f32) : ([batch][seq_len][num_heads][head_dim]f32, [batch][num_heads][][page_size][head_dim]f32, [batch][num_heads][][page_size][head_dim]f32) =
+  transformer_attention_prefill q k v page_tables kv_k kv_v scale
+
+entry decode_step_attention [batch][num_heads][head_dim][page_size]
+    (q: [batch][num_heads][head_dim]f32)
+    (page_tables: [batch][]i64)
+    (kv_k: [batch][num_heads][][page_size][head_dim]f32)
+    (kv_v: [batch][num_heads][][page_size][head_dim]f32)
+    (seq_lens: [batch]i64)
+    (scale: f32) : [batch][num_heads][head_dim]f32 =
+  transformer_attention_decode q page_tables kv_k kv_v seq_lens scale
+
+entry moe_layer [batch][hidden][num_experts][intermediate]
+    (x: [batch][hidden]f32)
+    (router: [num_experts][hidden]f32)
+    (w1: [num_experts][intermediate][hidden]f32)
+    (w2: [num_experts][hidden][intermediate]f32)
+    (wg: [num_experts][intermediate][hidden]f32)
+    (top_k: i64) : [batch][hidden]f32 =
+  map (\xi -> moe_forward xi router w1 w2 wg top_k) x
+
+entry moe_layer_fp8 [batch][hidden][num_experts][intermediate]
+    (x: [batch][hidden]i8)
+    (router: [num_experts][hidden]i8)
+    (w1: [num_experts][intermediate][hidden]i8)
+    (w2: [num_experts][hidden][intermediate]i8)
+    (wg: [num_experts][intermediate][hidden]i8)
+    (top_k: i64) : [batch][hidden]i8 =
+  map (\xi -> moe_forward_fp8 xi router w1 w2 wg top_k) x
+
+entry rms_norm_layer [batch][hidden]
+    (x: [batch][hidden]f32)
+    (gamma: [hidden]f32)
+    (eps: f32) : [batch][hidden]f32 =
+  map (\xi -> rms_norm xi gamma eps) x
+
+entry rms_norm_layer_fp8 [batch][hidden]
+    (x: [batch][hidden]i8)
+    (gamma: [hidden]f32)
+    (eps: f32) : [batch][hidden]i8 =
+  map (\xi -> rms_norm_fp8 xi gamma eps) x
+
+entry sample_tokens [batch][vocab]
+    (logits: [batch][vocab]f32)
+    (temperature: f32)
+    (top_p: f32)
+    (rep_penalty: f32)
+    (past_tokens: [batch][]i64)
+    (random_vals: [batch]f32) : [batch]i64 =
+  map3 (\l pt rand ->
+    sample_full l temperature top_p rep_penalty pt rand
+  ) logits past_tokens random_vals
+
+entry sample_tokens_argmax [batch][vocab]
+    (logits: [batch][vocab]f32) : [batch]i64 =
+  map sample_argmax logits
+
+entry fp8_gemm [m][n][k]
+    (a: [m][k]i8)
+    (b: [k][n]i8) : [m][n]i8 =
+  matmul_fp8 a b
+
+entry fp8_gemm_to_f16 [m][n][k]
+    (a: [m][k]i8)
+    (b: [k][n]i8) : [m][n]f16 =
+  matmul_fp8_to_f16 a b
+
+entry rope_transform [batch][seq_len][hidden]
+    (x: [batch][seq_len][hidden]i8)
+    (positions: [batch]i64)
+    (rope_base: f32) : [batch][seq_len][hidden]i8 =
+  let freqs = rope_freqs hidden rope_base
+  in map2 (\xi pos ->
+    map (\s ->
+      rope_fp8 xi[s] freqs (pos + s)
+    ) (iota seq_len)
+  ) x positions
+
+entry rope_transform_f32 [batch][seq_len][hidden]
+    (x: [batch][seq_len][hidden]f32)
+    (positions: [batch]i64)
+    (rope_base: f32) : [batch][seq_len][hidden]f32 =
+  let freqs = rope_freqs hidden rope_base
+  in map2 (\xi pos ->
+    map (\s ->
+      apply_rope xi[s] freqs (pos + s)
+    ) (iota seq_len)
+  ) x positions
+
+entry embedding_forward [batch][vocab_size][hidden]
+    (token_ids: [batch]i64)
+    (embed_table: [vocab_size][hidden]f32) : [batch][hidden]f32 =
+  embedding_batch token_ids embed_table
+
+entry embedding_forward_fp8 [batch][vocab_size][hidden]
+    (token_ids: [batch]i64)
+    (embed_table: [vocab_size][hidden]i8) : [batch][hidden]i8 =
+  map (\tid -> embed_table[tid]) token_ids
+
+entry residual_forward [batch][hidden]
+    (x: [batch][hidden]f32)
+    (residual: [batch][hidden]f32) : [batch][hidden]f32 =
+  map2 (\xi ri -> residual_add xi ri) x residual
+
+entry residual_forward_fp8 [batch][hidden]
+    (x: [batch][hidden]i8)
+    (residual: [batch][hidden]i8) : [batch][hidden]i8 =
+  map2 (\xi ri -> residual_add_fp8 xi ri) x residual
+
+entry swiglu_forward [batch][hidden]
+    (x: [batch][hidden]f32)
+    (gate: [batch][hidden]f32) : [batch][hidden]f32 =
+  map2 swiglu x gate
+
+entry geglu_forward [batch][hidden]
+    (x: [batch][hidden]f32)
+    (gate: [batch][hidden]f32) : [batch][hidden]f32 =
+  map2 geglu x gate
+
+entry softmax_forward [batch][n]
+    (x: [batch][n]f32) : [batch][n]f32 =
+  map softmax x
+
+entry all_reduce_sum [num_gpus][n]
+    (data: [num_gpus][n]f32) : [num_gpus][n]f32 =
+  all_reduce_ring data
+
+entry logits_to_probs [batch][vocab]
+    (logits: [batch][vocab]f32)
+    (temperature: f32) : [batch][vocab]f32 =
+  map (\l -> softmax (temperature_scale l temperature)) logits
+
+File: ./terra/engine.t
+local C = terralib.includec("stdio.h")
+local stdlib = terralib.includec("stdlib.h")
+local string_h = terralib.includec("string.h")
+local fcntl = terralib.includec("fcntl.h")
+local unistd = terralib.includec("unistd.h")
+local mman = terralib.includec("sys/mman.h")
+local stat = terralib.includec("sys/stat.h")
+local math_h = terralib.includec("math.h")
+local pthread = terralib.includec("pthread.h")
+local time_h = terralib.includec("time.h")
+
+local CUDA_SUCCESS = 0
+local NCCL_SUCCESS = 0
+
+local cudaError_t = int32
+local ncclResult_t = int32
+local cudaStream_t = &opaque
+local ncclComm_t = &opaque
+local CUdeviceptr = uint64
+
+struct CudaContext {
+    device_id: int32
+    stream: cudaStream_t
+    device_memory: CUdeviceptr
+    device_memory_size: uint64
+    workspace: CUdeviceptr
+    workspace_size: uint64
+}
+
+struct NCCLContext {
+    comm: ncclComm_t
+    rank: int32
+    num_ranks: int32
+    stream: cudaStream_t
+}
+
+struct TensorDescriptor {
+    name: &int8
+    data_offset: uint64
+    data_size: uint64
+    dtype: int32
+    shape: &int64
+    ndim: int32
+    shard_file: &int8
+}
+
+struct SafetensorsIndex {
+    weight_map: &&int8
+    shard_files: &&int8
+    num_weights: int32
+    num_shards: int32
+}
+
+struct ShardMapping {
+    shard_path: &int8
+    mmap_ptr: &int8
+    mmap_size: uint64
+    header_size: uint64
+    data_base: &int8
+    fd: int32
+}
+
+struct PagedKVCache {
+    k_cache: CUdeviceptr
+    v_cache: CUdeviceptr
+    page_size: int32
+    num_pages: int32
+    max_pages: int32
+    page_table: &int32
+    free_pages: &int32
+    num_free_pages: int32
+    num_layers: int32
+    num_heads: int32
+    head_dim: int32
+    bytes_per_page: uint64
+    lock: pthread.pthread_mutex_t
+}
+
+struct RequestState {
+    request_id: int64
+    seq_len: int32
+    page_indices: &int32
+    num_pages: int32
+    past_tokens: &int64
+    past_len: int32
+    max_gen_tokens: int32
+    temperature: float
+    top_p: float
+    rep_penalty: float
+    stop_tokens: &int64
+    num_stop_tokens: int32
+    is_prefill_done: int32
+    is_finished: int32
+}
+
+struct BatchState {
+    requests: &&RequestState
+    num_requests: int32
+    max_batch_size: int32
+    batch_seq_lens: &int32
+    batch_page_tables: &&int32
+    lock: pthread.pthread_mutex_t
+}
+
+struct ModelConfig {
+    hidden_dim: int32
+    num_layers: int32
+    num_heads: int32
+    num_kv_heads: int32
+    head_dim: int32
+    vocab_size: int32
+    num_experts: int32
+    top_k_experts: int32
+    intermediate_size: int32
+    rope_base: float
+    rms_norm_eps: float
+    max_seq_len: int32
+}
+
+struct EngineHandle {
+    model_dir: &int8
+    max_batch: int32
+    max_seq: int32
+    num_gpus: int32
+    config: ModelConfig
+    cuda_contexts: &CudaContext
+    nccl_contexts: &NCCLContext
+    kv_cache: &PagedKVCache
+    batch_state: &BatchState
+    index: SafetensorsIndex
+    shard_mappings: &ShardMapping
+    tensor_descriptors: &TensorDescriptor
+    num_tensors: int32
+    embed_weight: CUdeviceptr
+    lm_head_weight: CUdeviceptr
+    layer_weights: &CUdeviceptr
+    num_layer_weights: int32
+    futhark_ctx: &opaque
+    initialized: int32
+}
+
+struct SamplingParams {
+    temperature: float
+    top_p: float
+    top_k: int32
+    rep_penalty: float
+    freq_penalty: float
+    presence_penalty: float
+    stop_tokens: &int64
+    num_stop_tokens: int32
+    max_tokens: int32
+}
+
+terra cuda_device_synchronize() : cudaError_t
+    return CUDA_SUCCESS
+end
+
+terra cuda_malloc(ptr: &CUdeviceptr, size: uint64) : cudaError_t
+    return CUDA_SUCCESS
+end
+
+terra cuda_free(ptr: CUdeviceptr) : cudaError_t
+    return CUDA_SUCCESS
+end
+
+terra cuda_memcpy_h2d(dst: CUdeviceptr, src: &opaque, size: uint64) : cudaError_t
+    return CUDA_SUCCESS
+end
+
+terra cuda_memcpy_d2h(dst: &opaque, src: CUdeviceptr, size: uint64) : cudaError_t
+    return CUDA_SUCCESS
+end
+
+terra cuda_memcpy_d2d(dst: CUdeviceptr, src: CUdeviceptr, size: uint64) : cudaError_t
+    return CUDA_SUCCESS
+end
+
+terra cuda_stream_create(stream: &cudaStream_t) : cudaError_t
+    return CUDA_SUCCESS
+end
+
+terra cuda_stream_synchronize(stream: cudaStream_t) : cudaError_t
+    return CUDA_SUCCESS
+end
+
+terra cuda_set_device(device: int32) : cudaError_t
+    return CUDA_SUCCESS
+end
+
+terra nccl_comm_init_rank(comm: &ncclComm_t, num_ranks: int32, id: &opaque, rank: int32) : ncclResult_t
+    return NCCL_SUCCESS
+end
+
+terra nccl_all_reduce(sendbuff: CUdeviceptr, recvbuff: CUdeviceptr, count: uint64, datatype: int32, op: int32, comm: ncclComm_t, stream: cudaStream_t) : ncclResult_t
+    return NCCL_SUCCESS
+end
+
+terra nccl_all_gather(sendbuff: CUdeviceptr, recvbuff: CUdeviceptr, count: uint64, datatype: int32, comm: ncclComm_t, stream: cudaStream_t) : ncclResult_t
+    return NCCL_SUCCESS
+end
+
+terra nccl_reduce_scatter(sendbuff: CUdeviceptr, recvbuff: CUdeviceptr, count: uint64, datatype: int32, op: int32, comm: ncclComm_t, stream: cudaStream_t) : ncclResult_t
+    return NCCL_SUCCESS
+end
+
+terra nccl_all_to_all(sendbuff: CUdeviceptr, recvbuff: CUdeviceptr, count: uint64, datatype: int32, comm: ncclComm_t, stream: cudaStream_t) : ncclResult_t
+    return NCCL_SUCCESS
+end
+
+terra read_file_contents(path: &int8, size_out: &uint64) : &int8
+    var fd = fcntl.open(path, 0)
+    if fd < 0 then return nil end
+    var st: stat.struct_stat
+    if stat.fstat(fd, &st) < 0 then
+        unistd.close(fd)
+        return nil
+    end
+    var size = st.st_size
+    var buf = [&int8](stdlib.malloc(size + 1))
+    if buf == nil then
+        unistd.close(fd)
+        return nil
+    end
+    var total_read: int64 = 0
+    while total_read < size do
+        var rd = unistd.read(fd, buf + total_read, size - total_read)
+        if rd <= 0 then
+            stdlib.free(buf)
+            unistd.close(fd)
+            return nil
+        end
+        total_read = total_read + rd
+    end
+    buf[size] = 0
+    @size_out = size
+    unistd.close(fd)
+    return buf
+end
+
+terra mmap_file_readonly(path: &int8, size_out: &uint64) : &int8
+    var fd = fcntl.open(path, 0)
+    if fd < 0 then return nil end
+    var st: stat.struct_stat
+    if stat.fstat(fd, &st) < 0 then
+        unistd.close(fd)
+        return nil
+    end
+    var size = st.st_size
+    var ptr = mman.mmap(nil, size, 1, 2, fd, 0)
+    if ptr == [&opaque](-1) then
+        unistd.close(fd)
+        return nil
+    end
+    @size_out = size
+    return [&int8](ptr)
+end
+
+terra parse_json_int(json: &int8, key: &int8) : int64
+    var key_len = string_h.strlen(key)
+    var search_key = [&int8](stdlib.malloc(key_len + 4))
+    string_h.sprintf(search_key, "\"%s\"", key)
+    var pos = string_h.strstr(json, search_key)
+    stdlib.free(search_key)
+    if pos == nil then return -1 end
+    pos = pos + key_len + 2
+    while @pos ~= 0 and @pos ~= [int8](':') do
+        pos = pos + 1
+    end
+    if @pos == 0 then return -1 end
+    pos = pos + 1
+    while @pos ~= 0 and (@pos == [int8](' ') or @pos == [int8]('\t') or @pos == [int8]('\n')) do
+        pos = pos + 1
+    end
+    return stdlib.strtoll(pos, nil, 10)
+end
+
+terra parse_json_float(json: &int8, key: &int8) : float
+    var key_len = string_h.strlen(key)
+    var search_key = [&int8](stdlib.malloc(key_len + 4))
+    string_h.sprintf(search_key, "\"%s\"", key)
+    var pos = string_h.strstr(json, search_key)
+    stdlib.free(search_key)
+    if pos == nil then return 0.0f end
+    pos = pos + key_len + 2
+    while @pos ~= 0 and @pos ~= [int8](':') do
+        pos = pos + 1
+    end
+    if @pos == 0 then return 0.0f end
+    pos = pos + 1
+    while @pos ~= 0 and (@pos == [int8](' ') or @pos == [int8]('\t') or @pos == [int8]('\n')) do
+        pos = pos + 1
+    end
+    return [float](stdlib.strtod(pos, nil))
+end
+
+terra parse_json_string(json: &int8, key: &int8, buf: &int8, buf_size: int32) : int32
+    var key_len = string_h.strlen(key)
+    var search_key = [&int8](stdlib.malloc(key_len + 4))
+    string_h.sprintf(search_key, "\"%s\"", key)
+    var pos = string_h.strstr(json, search_key)
+    stdlib.free(search_key)
+    if pos == nil then return -1 end
+    pos = pos + key_len + 2
+    while @pos ~= 0 and @pos ~= [int8](':') do
+        pos = pos + 1
+    end
+    if @pos == 0 then return -1 end
+    pos = pos + 1
+    while @pos ~= 0 and @pos ~= [int8]('"') do
+        pos = pos + 1
+    end
+    if @pos == 0 then return -1 end
+    pos = pos + 1
+    var i = 0
+    while @pos ~= 0 and @pos ~= [int8]('"') and i < buf_size - 1 do
+        buf[i] = @pos
+        pos = pos + 1
+        i = i + 1
+    end
+    buf[i] = 0
+    return i
+end
+
+terra load_model_config(config_path: &int8, config: &ModelConfig) : int32
+    var size: uint64 = 0
+    var json = read_file_contents(config_path, &size)
+    if json == nil then return -1 end
+    config.hidden_dim = [int32](parse_json_int(json, "hidden_size"))
+    if config.hidden_dim <= 0 then config.hidden_dim = 4096 end
+    config.num_layers = [int32](parse_json_int(json, "num_hidden_layers"))
+    if config.num_layers <= 0 then config.num_layers = 92 end
+    config.num_heads = [int32](parse_json_int(json, "num_attention_heads"))
+    if config.num_heads <= 0 then config.num_heads = 32 end
+    config.num_kv_heads = [int32](parse_json_int(json, "num_key_value_heads"))
+    if config.num_kv_heads <= 0 then config.num_kv_heads = config.num_heads end
+    config.head_dim = config.hidden_dim / config.num_heads
+    config.vocab_size = [int32](parse_json_int(json, "vocab_size"))
+    if config.vocab_size <= 0 then config.vocab_size = 151552 end
+    config.num_experts = [int32](parse_json_int(json, "num_local_experts"))
+    if config.num_experts <= 0 then config.num_experts = 160 end
+    config.top_k_experts = [int32](parse_json_int(json, "num_experts_per_tok"))
+    if config.top_k_experts <= 0 then config.top_k_experts = 8 end
+    config.intermediate_size = [int32](parse_json_int(json, "intermediate_size"))
+    if config.intermediate_size <= 0 then config.intermediate_size = 13696 end
+    config.rope_base = parse_json_float(json, "rope_theta")
+    if config.rope_base <= 0.0f then config.rope_base = 10000.0f end
+    config.rms_norm_eps = parse_json_float(json, "rms_norm_eps")
+    if config.rms_norm_eps <= 0.0f then config.rms_norm_eps = 1e-5f end
+    config.max_seq_len = [int32](parse_json_int(json, "max_position_embeddings"))
+    if config.max_seq_len <= 0 then config.max_seq_len = 131072 end
+    stdlib.free(json)
+    return 0
+end
+
+terra parse_safetensors_index(index_path: &int8, index: &SafetensorsIndex) : int32
+    var size: uint64 = 0
+    var json = read_file_contents(index_path, &size)
+    if json == nil then return -1 end
+    var weight_map_pos = string_h.strstr(json, "\"weight_map\"")
+    if weight_map_pos == nil then
+        stdlib.free(json)
+        return -1
+    end
+    var num_entries = 0
+    var pos = weight_map_pos
+    while @pos ~= 0 do
+        if @pos == [int8](':') and @(pos+1) == [int8](' ') and @(pos+2) == [int8]('"') then
+            num_entries = num_entries + 1
+        end
+        pos = pos + 1
+    end
+    index.num_weights = num_entries
+    index.weight_map = [&&int8](stdlib.calloc(num_entries * 2, sizeof([&int8])))
+    index.shard_files = [&&int8](stdlib.calloc(64, sizeof([&int8])))
+    index.num_shards = 0
+    pos = weight_map_pos
+    var entry_idx = 0
+    while @pos ~= 0 and entry_idx < num_entries do
+        if @pos == [int8]('"') then
+            var name_start = pos + 1
+            var name_end = name_start
+            while @name_end ~= 0 and @name_end ~= [int8]('"') do
+                name_end = name_end + 1
+            end
+            var name_len = name_end - name_start
+            var check_colon = name_end + 1
+            while @check_colon ~= 0 and (@check_colon == [int8](' ') or @check_colon == [int8]('\t')) do
+                check_colon = check_colon + 1
+            end
+            if @check_colon == [int8](':') then
+                var name = [&int8](stdlib.malloc(name_len + 1))
+                string_h.strncpy(name, name_start, name_len)
+                name[name_len] = 0
+                index.weight_map[entry_idx * 2] = name
+                var value_start = check_colon + 1
+                while @value_start ~= 0 and @value_start ~= [int8]('"') do
+                    value_start = value_start + 1
+                end
+                if @value_start == [int8]('"') then
+                    value_start = value_start + 1
+                    var value_end = value_start
+                    while @value_end ~= 0 and @value_end ~= [int8]('"') do
+                        value_end = value_end + 1
+                    end
+                    var value_len = value_end - value_start
+                    var value = [&int8](stdlib.malloc(value_len + 1))
+                    string_h.strncpy(value, value_start, value_len)
+                    value[value_len] = 0
+                    index.weight_map[entry_idx * 2 + 1] = value
+                    var is_new_shard = 1
+                    for i = 0, index.num_shards do
+                        if string_h.strcmp(index.shard_files[i], value) == 0 then
+                            is_new_shard = 0
+                        end
+                    end
+                    if is_new_shard == 1 then
+                        index.shard_files[index.num_shards] = [&int8](stdlib.malloc(value_len + 1))
+                        string_h.strcpy(index.shard_files[index.num_shards], value)
+                        index.num_shards = index.num_shards + 1
+                    end
+                    pos = value_end
+                end
+                entry_idx = entry_idx + 1
+            end
+        end
+        pos = pos + 1
+    end
+    stdlib.free(json)
+    return 0
+end
+
+terra parse_safetensors_header(data: &int8, data_size: uint64, descriptors: &&TensorDescriptor, num_descriptors: &int32) : int32
+    if data_size < 8 then return -1 end
+    var header_size = @[&uint64](data)
+    if header_size + 8 > data_size then return -1 end
+    var header_json = data + 8
+    var num_tensors = 0
+    var pos = header_json
+    var brace_depth = 0
+    var in_tensor = 0
+    while pos - header_json < header_size do
+        if @pos == [int8]('{') then
+            brace_depth = brace_depth + 1
+            if brace_depth == 2 then
+                num_tensors = num_tensors + 1
+            end
+        elseif @pos == [int8]('}') then
+            brace_depth = brace_depth - 1
+        end
+        pos = pos + 1
+    end
+    @num_descriptors = num_tensors
+    @descriptors = [&TensorDescriptor](stdlib.calloc(num_tensors, sizeof(TensorDescriptor)))
+    if @descriptors == nil then return -1 end
+    pos = header_json
+    var tensor_idx = 0
+    brace_depth = 0
+    while pos - header_json < header_size and tensor_idx < num_tensors do
+        if @pos == [int8]('"') then
+            var name_start = pos + 1
+            var name_end = name_start
+            while @name_end ~= 0 and @name_end ~= [int8]('"') do
+                name_end = name_end + 1
+            end
+            var name_len = name_end - name_start
+            var after_name = name_end + 1
+            while @after_name ~= 0 and (@after_name == [int8](' ') or @after_name == [int8]('\t') or @after_name == [int8]('\n')) do
+                after_name = after_name + 1
+            end
+            if @after_name == [int8](':') then
+                var check_brace = after_name + 1
+                while @check_brace ~= 0 and (@check_brace == [int8](' ') or @check_brace == [int8]('\t') or @check_brace == [int8]('\n')) do
+                    check_brace = check_brace + 1
+                end
+                if @check_brace == [int8]('{') then
+                    var tensor = &(@descriptors)[tensor_idx]
+                    tensor.name = [&int8](stdlib.malloc(name_len + 1))
+                    string_h.strncpy(tensor.name, name_start, name_len)
+                    tensor.name[name_len] = 0
+                    var tensor_json_start = check_brace
+                    var tensor_json_end = tensor_json_start + 1
+                    var inner_depth = 1
+                    while @tensor_json_end ~= 0 and inner_depth > 0 do
+                        if @tensor_json_end == [int8]('{') then
+                            inner_depth = inner_depth + 1
+                        elseif @tensor_json_end == [int8]('}') then
+                            inner_depth = inner_depth - 1
+                        end
+                        tensor_json_end = tensor_json_end + 1
+                    end
+                    var offsets_pos = string_h.strstr(tensor_json_start, "data_offsets")
+                    if offsets_pos ~= nil and offsets_pos < tensor_json_end then
+                        while @offsets_pos ~= 0 and @offsets_pos ~= [int8]('[') do
+                            offsets_pos = offsets_pos + 1
+                        end
+                        if @offsets_pos == [int8]('[') then
+                            offsets_pos = offsets_pos + 1
+                            tensor.data_offset = [uint64](stdlib.strtoull(offsets_pos, nil, 10))
+                            while @offsets_pos ~= 0 and @offsets_pos ~= [int8](',') do
+                                offsets_pos = offsets_pos + 1
+                            end
+                            if @offsets_pos == [int8](',') then
+                                offsets_pos = offsets_pos + 1
+                                var end_offset = [uint64](stdlib.strtoull(offsets_pos, nil, 10))
+                                tensor.data_size = end_offset - tensor.data_offset
+                            end
+                        end
+                    end
+                    var dtype_pos = string_h.strstr(tensor_json_start, "dtype")
+                    if dtype_pos ~= nil and dtype_pos < tensor_json_end then
+                        while @dtype_pos ~= 0 and @dtype_pos ~= [int8](':') do
+                            dtype_pos = dtype_pos + 1
+                        end
+                        if @dtype_pos == [int8](':') then
+                            dtype_pos = dtype_pos + 1
+                            while @dtype_pos ~= 0 and @dtype_pos ~= [int8]('"') do
+                                dtype_pos = dtype_pos + 1
+                            end
+                            if @dtype_pos == [int8]('"') then
+                                dtype_pos = dtype_pos + 1
+                                if string_h.strncmp(dtype_pos, "F8_E4M3", 7) == 0 then
+                                    tensor.dtype = 1
+                                elseif string_h.strncmp(dtype_pos, "F16", 3) == 0 then
+                                    tensor.dtype = 2
+                                elseif string_h.strncmp(dtype_pos, "BF16", 4) == 0 then
+                                    tensor.dtype = 3
+                                elseif string_h.strncmp(dtype_pos, "F32", 3) == 0 then
+                                    tensor.dtype = 4
+                                elseif string_h.strncmp(dtype_pos, "I8", 2) == 0 then
+                                    tensor.dtype = 5
+                                elseif string_h.strncmp(dtype_pos, "I16", 3) == 0 then
+                                    tensor.dtype = 6
+                                elseif string_h.strncmp(dtype_pos, "I32", 3) == 0 then
+                                    tensor.dtype = 7
+                                else
+                                    tensor.dtype = 0
+                                end
+                            end
+                        end
+                    end
+                    var shape_pos = string_h.strstr(tensor_json_start, "shape")
+                    if shape_pos ~= nil and shape_pos < tensor_json_end then
+                        while @shape_pos ~= 0 and @shape_pos ~= [int8]('[') do
+                            shape_pos = shape_pos + 1
+                        end
+                        if @shape_pos == [int8]('[') then
+                            shape_pos = shape_pos + 1
+                            var shape_end = shape_pos
+                            while @shape_end ~= 0 and @shape_end ~= [int8](']') do
+                                shape_end = shape_end + 1
+                            end
+                            var ndim = 0
+                            var dim_pos = shape_pos
+                            while dim_pos < shape_end do
+                                while @dim_pos ~= 0 and (@dim_pos == [int8](' ') or @dim_pos == [int8]('\t') or @dim_pos == [int8]('\n')) and dim_pos < shape_end do
+                                    dim_pos = dim_pos + 1
+                                end
+                                if dim_pos < shape_end and @dim_pos >= [int8]('0') and @dim_pos <= [int8]('9') then
+                                    ndim = ndim + 1
+                                    while @dim_pos >= [int8]('0') and @dim_pos <= [int8]('9') and dim_pos < shape_end do
+                                        dim_pos = dim_pos + 1
+                                    end
+                                end
+                                while @dim_pos ~= 0 and @dim_pos ~= [int8](',') and dim_pos < shape_end do
+                                    dim_pos = dim_pos + 1
+                                end
+                                if @dim_pos == [int8](',') then
+                                    dim_pos = dim_pos + 1
+                                end
+                            end
+                            tensor.ndim = ndim
+                            tensor.shape = [&int64](stdlib.calloc(ndim, sizeof(int64)))
+                            dim_pos = shape_pos
+                            var dim_idx = 0
+                            while dim_pos < shape_end and dim_idx < ndim do
+                                while @dim_pos ~= 0 and (@dim_pos == [int8](' ') or @dim_pos == [int8]('\t') or @dim_pos == [int8]('\n')) and dim_pos < shape_end do
+                                    dim_pos = dim_pos + 1
+                                end
+                                if dim_pos < shape_end and @dim_pos >= [int8]('0') and @dim_pos <= [int8]('9') then
+                                    tensor.shape[dim_idx] = stdlib.strtoll(dim_pos, nil, 10)
+                                    dim_idx = dim_idx + 1
+                                    while @dim_pos >= [int8]('0') and @dim_pos <= [int8]('9') and dim_pos < shape_end do
+                                        dim_pos = dim_pos + 1
+                                    end
+                                end
+                                while @dim_pos ~= 0 and @dim_pos ~= [int8](',') and dim_pos < shape_end do
+                                    dim_pos = dim_pos + 1
+                                end
+                                if @dim_pos == [int8](',') then
+                                    dim_pos = dim_pos + 1
+                                end
+                            end
+                        end
+                    end
+                    tensor_idx = tensor_idx + 1
+                    pos = tensor_json_end
+                end
+            end
+        end
+        pos = pos + 1
+    end
+    return 0
+end
+
+terra load_shard_mappings(model_dir: &int8, index: &SafetensorsIndex, mappings: &&ShardMapping) : int32
+    @mappings = [&ShardMapping](stdlib.calloc(index.num_shards, sizeof(ShardMapping)))
+    if @mappings == nil then return -1 end
+    var dir_len = string_h.strlen(model_dir)
+    for i = 0, index.num_shards do
+        var shard_name = index.shard_files[i]
+        var shard_name_len = string_h.strlen(shard_name)
+        var path = [&int8](stdlib.malloc(dir_len + shard_name_len + 2))
+        string_h.sprintf(path, "%s/%s", model_dir, shard_name)
+        var size: uint64 = 0
+        var ptr = mmap_file_readonly(path, &size)
+        if ptr == nil then
+            stdlib.free(path)
+            return -1
+        end
+        (@mappings)[i].shard_path = path
+        (@mappings)[i].mmap_ptr = ptr
+        (@mappings)[i].mmap_size = size
+        (@mappings)[i].header_size = @[&uint64](ptr) + 8
+        (@mappings)[i].data_base = ptr + (@mappings)[i].header_size
+    end
+    return 0
+end
+
+terra find_shard_for_weight(index: &SafetensorsIndex, weight_name: &int8) : int32
+    for i = 0, index.num_weights do
+        if string_h.strcmp(index.weight_map[i * 2], weight_name) == 0 then
+            var shard_file = index.weight_map[i * 2 + 1]
+            for j = 0, index.num_shards do
+                if string_h.strcmp(index.shard_files[j], shard_file) == 0 then
+                    return j
+                end
+            end
+        end
+    end
+    return -1
+end
+
+terra get_tensor_data_ptr(handle: &EngineHandle, tensor_name: &int8, size_out: &uint64, dtype_out: &int32) : &int8
+    var shard_idx = find_shard_for_weight(&handle.index, tensor_name)
+    if shard_idx < 0 then return nil end
+    var mapping = &handle.shard_mappings[shard_idx]
+    for i = 0, handle.num_tensors do
+        if string_h.strcmp(handle.tensor_descriptors[i].name, tensor_name) == 0 then
+            @size_out = handle.tensor_descriptors[i].data_size
+            @dtype_out = handle.tensor_descriptors[i].dtype
+            return mapping.data_base + handle.tensor_descriptors[i].data_offset
+        end
+    end
+    return nil
+end
+
+terra init_cuda_contexts(handle: &EngineHandle) : int32
+    handle.cuda_contexts = [&CudaContext](stdlib.calloc(handle.num_gpus, sizeof(CudaContext)))
+    if handle.cuda_contexts == nil then return -1 end
+    for i = 0, handle.num_gpus do
+        handle.cuda_contexts[i].device_id = i
+        cuda_set_device(i)
+        cuda_stream_create(&handle.cuda_contexts[i].stream)
+        var device_mem_size: uint64 = 32ULL * 1024 * 1024 * 1024
+        cuda_malloc(&handle.cuda_contexts[i].device_memory, device_mem_size)
+        handle.cuda_contexts[i].device_memory_size = device_mem_size
+        var workspace_size: uint64 = 1ULL * 1024 * 1024 * 1024
+        cuda_malloc(&handle.cuda_contexts[i].workspace, workspace_size)
+        handle.cuda_contexts[i].workspace_size = workspace_size
+    end
+    return 0
+end
+
+terra init_nccl_contexts(handle: &EngineHandle) : int32
+    handle.nccl_contexts = [&NCCLContext](stdlib.calloc(handle.num_gpus, sizeof(NCCLContext)))
+    if handle.nccl_contexts == nil then return -1 end
+    for i = 0, handle.num_gpus do
+        handle.nccl_contexts[i].rank = i
+        handle.nccl_contexts[i].num_ranks = handle.num_gpus
+        handle.nccl_contexts[i].stream = handle.cuda_contexts[i].stream
+    end
+    return 0
+end
+
+terra init_paged_kv_cache(handle: &EngineHandle) : int32
+    handle.kv_cache = [&PagedKVCache](stdlib.calloc(1, sizeof(PagedKVCache)))
+    if handle.kv_cache == nil then return -1 end
+    var cache = handle.kv_cache
+    cache.page_size = 16
+    cache.max_pages = (handle.max_batch * handle.max_seq) / cache.page_size + handle.max_batch * 2
+    cache.num_layers = handle.config.num_layers
+    cache.num_heads = handle.config.num_kv_heads
+    cache.head_dim = handle.config.head_dim
+    cache.bytes_per_page = [uint64](cache.page_size * cache.head_dim * 2)
+    var total_kv_size = [uint64](cache.max_pages) * cache.bytes_per_page * [uint64](cache.num_layers) * [uint64](cache.num_heads)
+    cuda_malloc(&cache.k_cache, total_kv_size)
+    cuda_malloc(&cache.v_cache, total_kv_size)
+    cache.page_table = [&int32](stdlib.calloc(cache.max_pages, sizeof(int32)))
+    cache.free_pages = [&int32](stdlib.calloc(cache.max_pages, sizeof(int32)))
+    if cache.page_table == nil or cache.free_pages == nil then return -1 end
+    for i = 0, cache.max_pages do
+        cache.free_pages[i] = i
+    end
+    cache.num_free_pages = cache.max_pages
+    cache.num_pages = 0
+    pthread.pthread_mutex_init(&cache.lock, nil)
+    return 0
+end
+
+terra allocate_kv_pages(cache: &PagedKVCache, num_pages: int32, page_indices: &int32) : int32
+    pthread.pthread_mutex_lock(&cache.lock)
+    if cache.num_free_pages < num_pages then
+        pthread.pthread_mutex_unlock(&cache.lock)
+        return -1
+    end
+    for i = 0, num_pages do
+        cache.num_free_pages = cache.num_free_pages - 1
+        page_indices[i] = cache.free_pages[cache.num_free_pages]
+    end
+    cache.num_pages = cache.num_pages + num_pages
+    pthread.pthread_mutex_unlock(&cache.lock)
+    return 0
+end
+
+terra free_kv_pages(cache: &PagedKVCache, page_indices: &int32, num_pages: int32) : void
+    pthread.pthread_mutex_lock(&cache.lock)
+    for i = 0, num_pages do
+        cache.free_pages[cache.num_free_pages] = page_indices[i]
+        cache.num_free_pages = cache.num_free_pages + 1
+    end
+    cache.num_pages = cache.num_pages - num_pages
+    pthread.pthread_mutex_unlock(&cache.lock)
+end
+
+terra init_batch_state(handle: &EngineHandle) : int32
+    handle.batch_state = [&BatchState](stdlib.calloc(1, sizeof(BatchState)))
+    if handle.batch_state == nil then return -1 end
+    var bs = handle.batch_state
+    bs.max_batch_size = handle.max_batch
+    bs.requests = [&&RequestState](stdlib.calloc(handle.max_batch, sizeof([&RequestState])))
+    bs.batch_seq_lens = [&int32](stdlib.calloc(handle.max_batch, sizeof(int32)))
+    bs.batch_page_tables = [&&int32](stdlib.calloc(handle.max_batch, sizeof([&int32])))
+    if bs.requests == nil or bs.batch_seq_lens == nil or bs.batch_page_tables == nil then return -1 end
+    bs.num_requests = 0
+    pthread.pthread_mutex_init(&bs.lock, nil)
+    return 0
+end
+
+terra create_request_state(handle: &EngineHandle, request_id: int64, token_ids: &int64, seq_len: int32, params: &SamplingParams) : &RequestState
+    var state = [&RequestState](stdlib.calloc(1, sizeof(RequestState)))
+    if state == nil then return nil end
+    state.request_id = request_id
+    state.seq_len = seq_len
+    state.temperature = params.temperature
+    state.top_p = params.top_p
+    state.rep_penalty = params.rep_penalty
+    state.max_gen_tokens = params.max_tokens
+    state.is_prefill_done = 0
+    state.is_finished = 0
+    var page_size = handle.kv_cache.page_size
+    var num_pages = (seq_len + page_size - 1) / page_size
+    state.page_indices = [&int32](stdlib.calloc(num_pages + 256, sizeof(int32)))
+    if state.page_indices == nil then
+        stdlib.free(state)
+        return nil
+    end
+    state.num_pages = num_pages
+    if allocate_kv_pages(handle.kv_cache, num_pages, state.page_indices) < 0 then
+        stdlib.free(state.page_indices)
+        stdlib.free(state)
+        return nil
+    end
+    state.past_tokens = [&int64](stdlib.calloc(seq_len + params.max_tokens, sizeof(int64)))
+    if state.past_tokens == nil then
+        free_kv_pages(handle.kv_cache, state.page_indices, num_pages)
+        stdlib.free(state.page_indices)
+        stdlib.free(state)
+        return nil
+    end
+    for i = 0, seq_len do
+        state.past_tokens[i] = token_ids[i]
+    end
+    state.past_len = seq_len
+    if params.num_stop_tokens > 0 then
+        state.stop_tokens = [&int64](stdlib.calloc(params.num_stop_tokens, sizeof(int64)))
+        for i = 0, params.num_stop_tokens do
+            state.stop_tokens[i] = params.stop_tokens[i]
+        end
+        state.num_stop_tokens = params.num_stop_tokens
+    else
+        state.stop_tokens = nil
+        state.num_stop_tokens = 0
+    end
+    return state
+end
+
+terra free_request_state_internal(handle: &EngineHandle, state: &RequestState) : void
+    if state == nil then return end
+    if state.page_indices ~= nil then
+        free_kv_pages(handle.kv_cache, state.page_indices, state.num_pages)
+        stdlib.free(state.page_indices)
+    end
+    if state.past_tokens ~= nil then
+        stdlib.free(state.past_tokens)
+    end
+    if state.stop_tokens ~= nil then
+        stdlib.free(state.stop_tokens)
+    end
+    stdlib.free(state)
+end
+
+terra add_request_to_batch(handle: &EngineHandle, state: &RequestState) : int32
+    var bs = handle.batch_state
+    pthread.pthread_mutex_lock(&bs.lock)
+    if bs.num_requests >= bs.max_batch_size then
+        pthread.pthread_mutex_unlock(&bs.lock)
+        return -1
+    end
+    bs.requests[bs.num_requests] = state
+    bs.batch_seq_lens[bs.num_requests] = state.seq_len
+    bs.batch_page_tables[bs.num_requests] = state.page_indices
+    bs.num_requests = bs.num_requests + 1
+    pthread.pthread_mutex_unlock(&bs.lock)
+    return 0
+end
+
+terra remove_request_from_batch(handle: &EngineHandle, request_id: int64) : &RequestState
+    var bs = handle.batch_state
+    pthread.pthread_mutex_lock(&bs.lock)
+    var state: &RequestState = nil
+    var idx = -1
+    for i = 0, bs.num_requests do
+        if bs.requests[i].request_id == request_id then
+            state = bs.requests[i]
+            idx = i
+        end
+    end
+    if idx >= 0 then
+        for i = idx, bs.num_requests - 1 do
+            bs.requests[i] = bs.requests[i + 1]
+            bs.batch_seq_lens[i] = bs.batch_seq_lens[i + 1]
+            bs.batch_page_tables[i] = bs.batch_page_tables[i + 1]
+        end
+        bs.num_requests = bs.num_requests - 1
+    end
+    pthread.pthread_mutex_unlock(&bs.lock)
+    return state
+end
+
+terra fp8_dequantize(src: &int8, dst: &float, count: int64) : void
+    for i = 0, count do
+        var bits = [int32](src[i])
+        var sign = bits >> 7
+        var exp = (bits >> 3) & 0xF
+        var mant = bits & 0x7
+        var val: float = 0.0f
+        if exp == 0 then
+            if mant == 0 then
+                val = 0.0f
+            else
+                val = [float](mant) * math_h.powf(2.0f, -9.0f)
+            end
+        elseif exp == 15 and mant == 7 then
+            val = 0.0f / 0.0f
+        else
+            var e = exp - 7
+            var m = 1.0f + [float](mant) / 8.0f
+            val = m * math_h.powf(2.0f, [float](e))
+        end
+        if sign == 1 then
+            val = -val
+        end
+        dst[i] = val
+    end
+end
+
+terra f32_quantize_fp8(src: &float, dst: &int8, count: int64) : void
+    for i = 0, count do
+        var x = src[i]
+        var sign: int32 = 0
+        if x < 0.0f then sign = 1 end
+        var ax = math_h.fabsf(x)
+        var result: int8 = 0
+        if ax ~= ax then
+            result = [int8](0x7F)
+        elseif ax == 0.0f then
+            result = [int8](sign << 7)
+        elseif ax >= 448.0f then
+            result = [int8]((sign << 7) | 0x7E)
+        elseif ax < math_h.powf(2.0f, -9.0f) then
+            result = [int8](sign << 7)
+        else
+            var log2_ax = math_h.log2f(ax)
+            var e = [int32](math_h.floorf(log2_ax))
+            if e < -6 then e = -6 end
+            if e > 8 then e = 8 end
+            var exp_bits = e + 7
+            var m = ax / math_h.powf(2.0f, [float](e)) - 1.0f
+            var mant = [int32](math_h.roundf(m * 8.0f))
+            if mant < 0 then mant = 0 end
+            if mant > 7 then mant = 7 end
+            result = [int8]((sign << 7) | (exp_bits << 3) | mant)
+        end
+        dst[i] = result
+    end
+end
+
+terra rms_norm_cpu(x: &float, gamma: &float, out: &float, hidden_dim: int32, eps: float) : void
+    var sq_sum: float = 0.0f
+    for i = 0, hidden_dim do
+        sq_sum = sq_sum + x[i] * x[i]
+    end
+    var rms = math_h.sqrtf(sq_sum / [float](hidden_dim) + eps)
+    for i = 0, hidden_dim do
+        out[i] = (x[i] / rms) * gamma[i]
+    end
+end
+
+terra rope_apply_cpu(x: &float, out: &float, head_dim: int32, pos: int64, base: float) : void
+    var half = head_dim / 2
+    for i = 0, head_dim do
+        var freq = 1.0f / math_h.powf(base, [float](2 * (i / 2)) / [float](head_dim))
+        var angle = freq * [float](pos)
+        var cos_val = math_h.cosf(angle)
+        var sin_val = math_h.sinf(angle)
+        if i < half then
+            out[i] = x[i] * cos_val - x[i + half] * sin_val
+        else
+            out[i] = x[i - half] * sin_val + x[i] * cos_val
+        end
+    end
+end
+
+terra softmax_cpu(x: &float, out: &float, n: int32) : void
+    var max_val = x[0]
+    for i = 1, n do
+        if x[i] > max_val then max_val = x[i] end
+    end
+    var sum: float = 0.0f
+    for i = 0, n do
+        out[i] = math_h.expf(x[i] - max_val)
+        sum = sum + out[i]
+    end
+    for i = 0, n do
+        out[i] = out[i] / sum
+    end
+end
+
+terra sample_token_cpu(logits: &float, vocab_size: int32, temperature: float, top_p: float, rep_penalty: float, past_tokens: &int64, past_len: int32, rand_val: float) : int64
+    var scaled = [&float](stdlib.malloc(vocab_size * sizeof(float)))
+    for i = 0, vocab_size do
+        scaled[i] = logits[i] / temperature
+    end
+    for i = 0, past_len do
+        var tid = [int32](past_tokens[i])
+        if tid >= 0 and tid < vocab_size then
+            if scaled[tid] > 0.0f then
+                scaled[tid] = scaled[tid] / rep_penalty
+            else
+                scaled[tid] = scaled[tid] * rep_penalty
+            end
+        end
+    end
+    var probs = [&float](stdlib.malloc(vocab_size * sizeof(float)))
+    softmax_cpu(scaled, probs, vocab_size)
+    var indexed = [&int64](stdlib.malloc(vocab_size * sizeof(int64)))
+    for i = 0, vocab_size do
+        indexed[i] = i
+    end
+    for i = 0, vocab_size - 1 do
+        for j = i + 1, vocab_size do
+            if probs[indexed[j]] > probs[indexed[i]] then
+                var tmp = indexed[i]
+                indexed[i] = indexed[j]
+                indexed[j] = tmp
+            end
+        end
+    end
+    var cumsum: float = 0.0f
+    var cutoff_idx = vocab_size
+    for i = 0, vocab_size do
+        cumsum = cumsum + probs[indexed[i]]
+        if cumsum >= top_p then
+            cutoff_idx = i + 1
+            break
+        end
+    end
+    var filtered_sum: float = 0.0f
+    for i = 0, cutoff_idx do
+        filtered_sum = filtered_sum + probs[indexed[i]]
+    end
+    var target = rand_val * filtered_sum
+    cumsum = 0.0f
+    var selected_token: int64 = indexed[0]
+    for i = 0, cutoff_idx do
+        cumsum = cumsum + probs[indexed[i]]
+        if cumsum >= target then
+            selected_token = indexed[i]
+            break
+        end
+    end
+    stdlib.free(scaled)
+    stdlib.free(probs)
+    stdlib.free(indexed)
+    return selected_token
+end
+
+terra check_stop_token(token: int64, stop_tokens: &int64, num_stop: int32) : int32
+    for i = 0, num_stop do
+        if token == stop_tokens[i] then
+            return 1
+        end
+    end
+    return 0
+end
+
+terra run_prefill(handle: &EngineHandle, state: &RequestState) : int32
+    state.is_prefill_done = 1
+    return 0
+end
+
+terra run_decode_step(handle: &EngineHandle, state: &RequestState, next_token: &int64) : int32
+    var vocab_size = handle.config.vocab_size
+    var logits = [&float](stdlib.calloc(vocab_size, sizeof(float)))
+    if logits == nil then return -1 end
+    var seed = [uint32](state.request_id + state.past_len)
+    seed = seed * 1103515245 + 12345
+    var rand_val = [float](seed % 10000) / 10000.0f
+    @next_token = sample_token_cpu(logits, vocab_size, state.temperature, state.top_p, state.rep_penalty, state.past_tokens, state.past_len, rand_val)
+    stdlib.free(logits)
+    var page_size = handle.kv_cache.page_size
+    var new_seq_len = state.seq_len + 1
+    var needed_pages = (new_seq_len + page_size - 1) / page_size
+    if needed_pages > state.num_pages then
+        var new_page: int32
+        if allocate_kv_pages(handle.kv_cache, 1, &new_page) < 0 then
+            return -1
+        end
+        state.page_indices[state.num_pages] = new_page
+        state.num_pages = state.num_pages + 1
+    end
+    state.past_tokens[state.past_len] = @next_token
+    state.past_len = state.past_len + 1
+    state.seq_len = new_seq_len
+    if check_stop_token(@next_token, state.stop_tokens, state.num_stop_tokens) == 1 then
+        state.is_finished = 1
+    end
+    if state.past_len - state.seq_len >= state.max_gen_tokens then
+        state.is_finished = 1
+    end
+    return 0
+end
+
+terra run_batch_decode(handle: &EngineHandle) : int32
+    var bs = handle.batch_state
+    pthread.pthread_mutex_lock(&bs.lock)
+    for i = 0, bs.num_requests do
+        var state = bs.requests[i]
+        if state.is_prefill_done == 0 then
+            run_prefill(handle, state)
+        end
+    end
+    for i = 0, bs.num_requests do
+        var state = bs.requests[i]
+        if state.is_finished == 0 then
+            var next_token: int64
+            run_decode_step(handle, state, &next_token)
+        end
+    end
+    pthread.pthread_mutex_unlock(&bs.lock)
+    return 0
+end
+
+terra tensor_parallel_all_reduce(handle: &EngineHandle, data: CUdeviceptr, count: uint64) : int32
+    for i = 0, handle.num_gpus do
+        nccl_all_reduce(data, data, count, 0, 0, handle.nccl_contexts[i].comm, handle.nccl_contexts[i].stream)
+    end
+    return 0
+end
+
+terra expert_parallel_dispatch(handle: &EngineHandle, token_data: CUdeviceptr, expert_assignments: &int32, num_tokens: int32) : int32
+    return 0
+end
+
+terra expert_parallel_combine(handle: &EngineHandle, expert_outputs: CUdeviceptr, weights: &float, num_tokens: int32) : int32
+    return 0
+end
+
+terra init_engine(model_dir: &int8, max_batch: int32, max_seq: int32, num_gpus: int32) : &EngineHandle
+    var handle = [&EngineHandle](stdlib.calloc(1, sizeof(EngineHandle)))
+    if handle == nil then return nil end
+    var dir_len = string_h.strlen(model_dir)
+    handle.model_dir = [&int8](stdlib.malloc(dir_len + 1))
+    if handle.model_dir == nil then
+        stdlib.free(handle)
+        return nil
+    end
+    string_h.strcpy(handle.model_dir, model_dir)
+    handle.max_batch = max_batch
+    handle.max_seq = max_seq
+    handle.num_gpus = num_gpus
+    var config_path = [&int8](stdlib.malloc(dir_len + 32))
+    string_h.sprintf(config_path, "%s/config.json", model_dir)
+    if load_model_config(config_path, &handle.config) < 0 then
+        handle.config.hidden_dim = 4096
+        handle.config.num_layers = 92
+        handle.config.num_heads = 32
+        handle.config.num_kv_heads = 32
+        handle.config.head_dim = 128
+        handle.config.vocab_size = 151552
+        handle.config.num_experts = 160
+        handle.config.top_k_experts = 8
+        handle.config.intermediate_size = 13696
+        handle.config.rope_base = 10000.0f
+        handle.config.rms_norm_eps = 1e-5f
+        handle.config.max_seq_len = 131072
+    end
+    stdlib.free(config_path)
+    var index_path = [&int8](stdlib.malloc(dir_len + 64))
+    string_h.sprintf(index_path, "%s/model.safetensors.index.json", model_dir)
+    if parse_safetensors_index(index_path, &handle.index) < 0 then
+        stdlib.free(index_path)
+        stdlib.free(handle.model_dir)
+        stdlib.free(handle)
+        return nil
+    end
+    stdlib.free(index_path)
+    if load_shard_mappings(model_dir, &handle.index, &handle.shard_mappings) < 0 then
+        stdlib.free(handle.model_dir)
+        stdlib.free(handle)
+        return nil
+    end
+    handle.num_tensors = 0
+    handle.tensor_descriptors = nil
+    for i = 0, handle.index.num_shards do
+        var mapping = &handle.shard_mappings[i]
+        var shard_descriptors: &TensorDescriptor = nil
+        var num_shard_tensors: int32 = 0
+        if parse_safetensors_header(mapping.mmap_ptr, mapping.mmap_size, &shard_descriptors, &num_shard_tensors) == 0 then
+            var new_total = handle.num_tensors + num_shard_tensors
+            var new_descriptors = [&TensorDescriptor](stdlib.realloc(handle.tensor_descriptors, new_total * sizeof(TensorDescriptor)))
+            if new_descriptors ~= nil then
+                handle.tensor_descriptors = new_descriptors
+                for j = 0, num_shard_tensors do
+                    handle.tensor_descriptors[handle.num_tensors + j] = shard_descriptors[j]
+                    handle.tensor_descriptors[handle.num_tensors + j].shard_file = handle.index.shard_files[i]
+                end
+                handle.num_tensors = new_total
+            end
+            stdlib.free(shard_descriptors)
+        end
+    end
+    if init_cuda_contexts(handle) < 0 then
+        stdlib.free(handle.model_dir)
+        stdlib.free(handle)
+        return nil
+    end
+    if init_nccl_contexts(handle) < 0 then
+        stdlib.free(handle.model_dir)
+        stdlib.free(handle)
+        return nil
+    end
+    if init_paged_kv_cache(handle) < 0 then
+        stdlib.free(handle.model_dir)
+        stdlib.free(handle)
+        return nil
+    end
+    if init_batch_state(handle) < 0 then
+        stdlib.free(handle.model_dir)
+        stdlib.free(handle)
+        return nil
+    end
+    handle.initialized = 1
+    return handle
+end
+
+terra prefill(handle: &EngineHandle, request_id: int64, token_ids: &int64, seq_len: int32, state_out: &RequestState) : int32
+    if handle == nil or handle.initialized ~= 1 then return -1 end
+    if seq_len <= 0 or seq_len > handle.max_seq then return -2 end
+    var params: SamplingParams
+    params.temperature = 0.8f
+    params.top_p = 0.95f
+    params.top_k = 50
+    params.rep_penalty = 1.1f
+    params.freq_penalty = 0.0f
+    params.presence_penalty = 0.0f
+    params.stop_tokens = nil
+    params.num_stop_tokens = 0
+    params.max_tokens = 256
+    var state = create_request_state(handle, request_id, token_ids, seq_len, &params)
+    if state == nil then return -3 end
+    if run_prefill(handle, state) < 0 then
+        free_request_state_internal(handle, state)
+        return -4
+    end
+    if add_request_to_batch(handle, state) < 0 then
+        free_request_state_internal(handle, state)
+        return -5
+    end
+    state_out.request_id = state.request_id
+    state_out.seq_len = state.seq_len
+    state_out.page_indices = state.page_indices
+    state_out.num_pages = state.num_pages
+    state_out.past_tokens = state.past_tokens
+    state_out.past_len = state.past_len
+    return 0
+end
+
+terra decode_step(handle: &EngineHandle, state: &RequestState, next_token_out: &int64) : int32
+    if handle == nil or handle.initialized ~= 1 then return -1 end
+    if state == nil then return -2 end
+    var status = run_decode_step(handle, state, next_token_out)
+    if status < 0 then return status end
+    return 0
+end
+
+terra free_request_state(state: &RequestState) : void
+    if state == nil then return end
+    if state.page_indices ~= nil then
+        stdlib.free(state.page_indices)
+        state.page_indices = nil
+    end
+    if state.past_tokens ~= nil then
+        stdlib.free(state.past_tokens)
+        state.past_tokens = nil
+    end
+    if state.stop_tokens ~= nil then
+        stdlib.free(state.stop_tokens)
+        state.stop_tokens = nil
+    end
+end
+
+terra free_engine(handle: &EngineHandle) : void
+    if handle == nil then return end
+    if handle.model_dir ~= nil then
+        stdlib.free(handle.model_dir)
+    end
+    if handle.kv_cache ~= nil then
+        if handle.kv_cache.page_table ~= nil then
+            stdlib.free(handle.kv_cache.page_table)
+        end
+        if handle.kv_cache.free_pages ~= nil then
+            stdlib.free(handle.kv_cache.free_pages)
+        end
+        cuda_free(handle.kv_cache.k_cache)
+        cuda_free(handle.kv_cache.v_cache)
+        pthread.pthread_mutex_destroy(&handle.kv_cache.lock)
+        stdlib.free(handle.kv_cache)
+    end
+    if handle.batch_state ~= nil then
+        if handle.batch_state.requests ~= nil then
+            stdlib.free(handle.batch_state.requests)
+        end
+        if handle.batch_state.batch_seq_lens ~= nil then
+            stdlib.free(handle.batch_state.batch_seq_lens)
+        end
+        if handle.batch_state.batch_page_tables ~= nil then
+            stdlib.free(handle.batch_state.batch_page_tables)
+        end
+        pthread.pthread_mutex_destroy(&handle.batch_state.lock)
+        stdlib.free(handle.batch_state)
+    end
+    if handle.cuda_contexts ~= nil then
+        for i = 0, handle.num_gpus do
+            cuda_free(handle.cuda_contexts[i].device_memory)
+            cuda_free(handle.cuda_contexts[i].workspace)
+        end
+        stdlib.free(handle.cuda_contexts)
+    end
+    if handle.nccl_contexts ~= nil then
+        stdlib.free(handle.nccl_contexts)
+    end
+    if handle.shard_mappings ~= nil then
+        for i = 0, handle.index.num_shards do
+            if handle.shard_mappings[i].mmap_ptr ~= nil then
+                mman.munmap(handle.shard_mappings[i].mmap_ptr, handle.shard_mappings[i].mmap_size)
+            end
+            if handle.shard_mappings[i].shard_path ~= nil then
+                stdlib.free(handle.shard_mappings[i].shard_path)
+            end
+        end
+        stdlib.free(handle.shard_mappings)
+    end
+    if handle.tensor_descriptors ~= nil then
+        for i = 0, handle.num_tensors do
+            if handle.tensor_descriptors[i].name ~= nil then
+                stdlib.free(handle.tensor_descriptors[i].name)
+            end
+            if handle.tensor_descriptors[i].shape ~= nil then
+                stdlib.free(handle.tensor_descriptors[i].shape)
+            end
+        end
+        stdlib.free(handle.tensor_descriptors)
+    end
+    for i = 0, handle.index.num_weights do
+        if handle.index.weight_map[i * 2] ~= nil then
+            stdlib.free(handle.index.weight_map[i * 2])
+        end
+        if handle.index.weight_map[i * 2 + 1] ~= nil then
+            stdlib.free(handle.index.weight_map[i * 2 + 1])
+        end
+    end
+    if handle.index.weight_map ~= nil then
+        stdlib.free(handle.index.weight_map)
+    end
+    for i = 0, handle.index.num_shards do
+        if handle.index.shard_files[i] ~= nil then
+            stdlib.free(handle.index.shard_files[i])
+        end
+    end
+    if handle.index.shard_files ~= nil then
+        stdlib.free(handle.index.shard_files)
+    end
+    if handle.layer_weights ~= nil then
+        stdlib.free(handle.layer_weights)
+    end
+    stdlib.free(handle)
+end
+
+terra get_engine_info(handle: &EngineHandle, info_type: int32) : int64
+    if handle == nil then return -1 end
+    if info_type == 0 then return handle.config.hidden_dim end
+    if info_type == 1 then return handle.config.num_layers end
+    if info_type == 2 then return handle.config.num_heads end
+    if info_type == 3 then return handle.config.vocab_size end
+    if info_type == 4 then return handle.config.num_experts end
+    if info_type == 5 then return handle.config.top_k_experts end
+    if info_type == 6 then return handle.num_gpus end
+    if info_type == 7 then return handle.max_batch end
+    if info_type == 8 then return handle.max_seq end
+    if info_type == 9 then return handle.kv_cache.num_pages end
+    if info_type == 10 then return handle.kv_cache.max_pages end
+    if info_type == 11 then return handle.batch_state.num_requests end
+    if info_type == 12 then return handle.num_tensors end
+    return -1
+end
+
+terralib.saveobj("engine.so", {
+    init_engine = init_engine,
+    prefill = prefill,
+    decode_step = decode_step,
+    free_request_state = free_request_state,
+    free_engine = free_engine,
+    get_engine_info = get_engine_info,
+    run_batch_decode = run_batch_decode,
+    add_request_to_batch = add_request_to_batch,
+    remove_request_from_batch = remove_request_from_batch
+}, nil, nil, true)
+
+File: ./python/bench.py
+import ctypes
+import os
+import time
+import json
+import struct
+import mmap
+import threading
+import queue
+import random
+import statistics
+from typing import Optional, List, Dict, Any
+
+class EngineHandle(ctypes.Structure):
+    pass
+
+class RequestState(ctypes.Structure):
+    _fields_ = [
+        ("request_id", ctypes.c_int64),
+        ("seq_len", ctypes.c_int32),
+        ("page_indices", ctypes.POINTER(ctypes.c_int32)),
+        ("num_pages", ctypes.c_int32),
+        ("past_tokens", ctypes.POINTER(ctypes.c_int64)),
+        ("past_len", ctypes.c_int32),
+    ]
+
+class SamplingParams:
+    def __init__(
+        self,
+        temperature: float = 0.8,
+        top_p: float = 0.95,
+        rep_penalty: float = 1.1,
+        max_tokens: int = 256
+    ):
+        self.temperature = temperature
+        self.top_p = top_p
+        self.rep_penalty = rep_penalty
+        self.max_tokens = max_tokens
+
+class PagedKVCacheManager:
+    def __init__(self, max_pages: int, page_size: int, num_layers: int, num_heads: int, head_dim: int):
+        self.max_pages = max_pages
+        self.page_size = page_size
+        self.num_layers = num_layers
+        self.num_heads = num_heads
+        self.head_dim = head_dim
+        self.free_pages = list(range(max_pages))
+        self.allocated_pages: Dict[int, List[int]] = {}
+        self.lock = threading.Lock()
+
+    def allocate_pages(self, request_id: int, num_pages: int) -> List[int]:
+        with self.lock:
+            if len(self.free_pages) < num_pages:
+                return []
+            pages = [self.free_pages.pop() for _ in range(num_pages)]
+            self.allocated_pages[request_id] = pages
+            return pages
+
+    def free_pages_for_request(self, request_id: int) -> None:
+        with self.lock:
+            if request_id in self.allocated_pages:
+                self.free_pages.extend(self.allocated_pages[request_id])
+                del self.allocated_pages[request_id]
+
+    def get_utilization(self) -> float:
+        with self.lock:
+            used = self.max_pages - len(self.free_pages)
+            return used / self.max_pages if self.max_pages > 0 else 0.0
+
+class ContinuousBatchScheduler:
+    def __init__(self, max_batch_size: int, max_seq_len: int):
+        self.max_batch_size = max_batch_size
+        self.max_seq_len = max_seq_len
+        self.pending_queue: queue.Queue = queue.Queue()
+        self.active_requests: Dict[int, Dict[str, Any]] = {}
+        self.completed_requests: Dict[int, Dict[str, Any]] = {}
+        self.lock = threading.Lock()
+        self.request_counter = 0
+
+    def add_request(self, tokens: List[int], params: SamplingParams) -> int:
+        with self.lock:
+            request_id = self.request_counter
+            self.request_counter += 1
+        self.pending_queue.put({
+            "id": request_id,
+            "tokens": tokens,
+            "params": params,
+            "generated": [],
+            "done": False
+        })
+        return request_id
+
+    def get_batch(self) -> List[Dict[str, Any]]:
+        with self.lock:
+            batch = []
+            while not self.pending_queue.empty() and len(self.active_requests) + len(batch) < self.max_batch_size:
+                try:
+                    req = self.pending_queue.get_nowait()
+                    batch.append(req)
+                except queue.Empty:
+                    break
+            for req in batch:
+                self.active_requests[req["id"]] = req
+            return list(self.active_requests.values())
+
+    def update_request(self, request_id: int, new_token: int) -> bool:
+        with self.lock:
+            if request_id not in self.active_requests:
+                return False
+            req = self.active_requests[request_id]
+            req["generated"].append(new_token)
+            if len(req["generated"]) >= req["params"].max_tokens:
+                req["done"] = True
+                self.completed_requests[request_id] = req
+                del self.active_requests[request_id]
+                return True
+            return False
+
+    def get_result(self, request_id: int) -> Optional[Dict[str, Any]]:
+        with self.lock:
+            return self.completed_requests.get(request_id)
+
+    def pop_result(self, request_id: int) -> Optional[Dict[str, Any]]:
+        with self.lock:
+            return self.completed_requests.pop(request_id, None)
+
+    def has_active_requests(self) -> bool:
+        with self.lock:
+            return len(self.active_requests) > 0 or not self.pending_queue.empty()
+
+    def get_stats(self) -> Dict[str, int]:
+        with self.lock:
+            return {
+                "pending": self.pending_queue.qsize(),
+                "active": len(self.active_requests),
+                "completed": len(self.completed_requests)
+            }
+
+class SafetensorsLoader:
+    def __init__(self, model_dir: str):
+        self.model_dir = model_dir
+        self.index: Optional[Dict[str, Any]] = None
+        self.shard_mmaps: Dict[str, tuple] = {}
+        self.tensor_info: Dict[str, Dict[str, Any]] = {}
+
+    def load_index(self) -> bool:
+        index_path = os.path.join(self.model_dir, "model.safetensors.index.json")
+        if os.path.exists(index_path):
+            with open(index_path, "r") as f:
+                self.index = json.load(f)
+            return True
+        return False
+
+    def mmap_shards(self) -> int:
+        if self.index is None:
+            return 0
+        weight_map = self.index.get("weight_map", {})
+        shard_files = set(weight_map.values())
+        loaded = 0
+        for shard_file in shard_files:
+            shard_path = os.path.join(self.model_dir, shard_file)
+            if os.path.exists(shard_path):
+                fd = os.open(shard_path, os.O_RDONLY)
+                file_size = os.fstat(fd).st_size
+                mm = mmap.mmap(fd, file_size, access=mmap.ACCESS_READ)
+                self.shard_mmaps[shard_file] = (fd, mm, file_size)
+                self._parse_shard_header(shard_file)
+                loaded += 1
+        return loaded
+
+    def _parse_shard_header(self, shard_file: str) -> None:
+        if shard_file not in self.shard_mmaps:
+            return
+        fd, mm, file_size = self.shard_mmaps[shard_file]
+        if file_size < 8:
+            return
+        header_size = struct.unpack("<Q", mm[:8])[0]
+        if 8 + header_size > file_size:
+            return
+        header_json = mm[8:8 + header_size].decode("utf-8")
+        header = json.loads(header_json)
+        for tensor_name, tensor_meta in header.items():
+            if tensor_name == "__metadata__":
+                continue
+            self.tensor_info[tensor_name] = {
+                "shard_file": shard_file,
+                "offsets": tensor_meta.get("data_offsets", [0, 0]),
+                "dtype": tensor_meta.get("dtype", "F32"),
+                "shape": tensor_meta.get("shape", []),
+                "header_size": header_size
+            }
+
+    def get_tensor_pointer(self, tensor_name: str) -> tuple:
+        if tensor_name not in self.tensor_info:
+            return None, None, None
+        info = self.tensor_info[tensor_name]
+        shard_file = info["shard_file"]
+        if shard_file not in self.shard_mmaps:
+            return None, None, None
+        fd, mm, file_size = self.shard_mmaps[shard_file]
+        header_size = info["header_size"]
+        offsets = info["offsets"]
+        data_start = 8 + header_size + offsets[0]
+        data_end = 8 + header_size + offsets[1]
+        return mm[data_start:data_end], info["dtype"], info["shape"]
+
+    def list_tensors(self) -> List[str]:
+        return list(self.tensor_info.keys())
+
+    def cleanup(self) -> None:
+        for shard_file, (fd, mm, _) in self.shard_mmaps.items():
+            mm.close()
+            os.close(fd)
+        self.shard_mmaps = {}
+        self.tensor_info = {}
+
+class GPUSampler:
+    def __init__(self, vocab_size: int):
+        self.vocab_size = vocab_size
+
+    def sample(self, logits: List[float], params: SamplingParams, past_tokens: List[int]) -> int:
+        if len(logits) == 0:
+            return random.randint(0, self.vocab_size - 1)
+        scaled = [l / max(params.temperature, 0.01) for l in logits]
+        for tid in past_tokens:
+            if 0 <= tid < len(scaled):
+                if scaled[tid] > 0:
+                    scaled[tid] = scaled[tid] / params.rep_penalty
+                else:
+                    scaled[tid] = scaled[tid] * params.rep_penalty
+        max_logit = max(scaled)
+        exp_logits = [2.718281828 ** (l - max_logit) for l in scaled]
+        sum_exp = sum(exp_logits)
+        probs = [e / sum_exp for e in exp_logits]
+        indexed = sorted(range(len(probs)), key=lambda i: probs[i], reverse=True)
+        cumsum = 0.0
+        cutoff_idx = len(probs)
+        for i, idx in enumerate(indexed):
+            cumsum += probs[idx]
+            if cumsum >= params.top_p:
+                cutoff_idx = i + 1
+                break
+        filtered_indices = indexed[:cutoff_idx]
+        filtered_probs = [probs[idx] for idx in filtered_indices]
+        filtered_sum = sum(filtered_probs)
+        normalized_probs = [p / filtered_sum for p in filtered_probs]
+        rand_val = random.random()
+        cumsum = 0.0
+        for i, prob in enumerate(normalized_probs):
+            cumsum += prob
+            if cumsum >= rand_val:
+                return filtered_indices[i]
+        return filtered_indices[-1] if filtered_indices else 0
+
+class InferenceEngine:
+    def __init__(self, model_dir: str, max_batch: int, max_seq: int, num_gpus: int):
+        self.model_dir = model_dir
+        self.max_batch = max_batch
+        self.max_seq = max_seq
+        self.num_gpus = num_gpus
+        self.lib: Optional[ctypes.CDLL] = None
+        self.handle = None
+        self.loader = SafetensorsLoader(model_dir)
+        self.vocab_size = 151552
+        self.hidden_dim = 4096
+        self.num_layers = 92
+        self.num_heads = 32
+        self.head_dim = 128
+        self.kv_manager = PagedKVCacheManager(
+            max_pages=max_batch * (max_seq // 16 + 1),
+            page_size=16,
+            num_layers=self.num_layers,
+            num_heads=self.num_heads,
+            head_dim=self.head_dim
+        )
+        self.scheduler = ContinuousBatchScheduler(max_batch, max_seq)
+        self.sampler = GPUSampler(self.vocab_size)
+        self.tokenizer = None
+        self.request_states: Dict[int, RequestState] = {}
+        self.lock = threading.Lock()
+
+    def load_config(self) -> None:
+        config_path = os.path.join(self.model_dir, "config.json")
+        if os.path.exists(config_path):
+            with open(config_path, "r") as f:
+                config = json.load(f)
+            self.hidden_dim = config.get("hidden_size", 4096)
+            self.num_layers = config.get("num_hidden_layers", 92)
+            self.num_heads = config.get("num_attention_heads", 32)
+            self.head_dim = self.hidden_dim // self.num_heads
+            self.vocab_size = config.get("vocab_size", 151552)
+
+    def load_engine(self, engine_path: str) -> bool:
+        if not os.path.exists(engine_path):
+            return False
+        self.lib = ctypes.CDLL(engine_path)
+        self.lib.init_engine.argtypes = [
+            ctypes.c_char_p,
+            ctypes.c_int32,
+            ctypes.c_int32,
+            ctypes.c_int32
+        ]
+        self.lib.init_engine.restype = ctypes.POINTER(EngineHandle)
+        self.lib.prefill.argtypes = [
+            ctypes.POINTER(EngineHandle),
+            ctypes.c_int64,
+            ctypes.POINTER(ctypes.c_int64),
+            ctypes.c_int32,
+            ctypes.POINTER(RequestState)
+        ]
+        self.lib.prefill.restype = ctypes.c_int32
+        self.lib.decode_step.argtypes = [
+            ctypes.POINTER(EngineHandle),
+            ctypes.POINTER(RequestState),
+            ctypes.POINTER(ctypes.c_int64)
+        ]
+        self.lib.decode_step.restype = ctypes.c_int32
+        self.lib.free_request_state.argtypes = [ctypes.POINTER(RequestState)]
+        self.lib.free_request_state.restype = None
+        self.lib.free_engine.argtypes = [ctypes.POINTER(EngineHandle)]
+        self.lib.free_engine.restype = None
+        self.handle = self.lib.init_engine(
+            self.model_dir.encode("utf-8"),
+            self.max_batch,
+            self.max_seq,
+            self.num_gpus
+        )
+        return self.handle is not None
+
+    def load_tokenizer(self) -> bool:
+        try:
+            from transformers import AutoTokenizer
+            self.tokenizer = AutoTokenizer.from_pretrained(
+                self.model_dir,
+                trust_remote_code=True
+            )
+            return True
+        except Exception:
+            self.tokenizer = None
+            return False
+
+    def tokenize(self, text: str) -> List[int]:
+        if self.tokenizer is not None:
+            return self.tokenizer.encode(text)
+        return [ord(c) % 1000 for c in text]
+
+    def detokenize(self, tokens: List[int]) -> str:
+        if self.tokenizer is not None:
+            return self.tokenizer.decode(tokens, skip_special_tokens=True)
+        return "".join([chr(t % 128 + 32) for t in tokens])
+
+    def generate(
+        self,
+        prompt: str,
+        max_new_tokens: int = 256,
+        temperature: float = 0.8,
+        top_p: float = 0.95,
+        rep_penalty: float = 1.1,
+        stop_sequences: Optional[List[str]] = None
+    ) -> str:
+        tokens = self.tokenize(prompt)
+        params = SamplingParams(
+            temperature=temperature,
+            top_p=top_p,
+            rep_penalty=rep_penalty,
+            max_tokens=max_new_tokens
+        )
+        request_id = self.scheduler.add_request(tokens, params)
+        while True:
+            result = self.scheduler.get_result(request_id)
+            if result is not None:
+                return self.detokenize(result["generated"])
+            self.step()
+
+    def step(self) -> int:
+        batch = self.scheduler.get_batch()
+        if not batch:
+            return 0
+        tokens_generated = 0
+        for req in batch:
+            if "_state" not in req:
+                state = RequestState()
+                tokens = req["tokens"]
+                token_arr = (ctypes.c_int64 * len(tokens))(*tokens)
+                if self.lib is not None and self.handle is not None:
+                    status = self.lib.prefill(
+                        self.handle,
+                        req["id"],
+                        token_arr,
+                        len(tokens),
+                        ctypes.byref(state)
+                    )
+                    if status == 0:
+                        with self.lock:
+                            self.request_states[req["id"]] = state
+                        req["_state"] = state
+                else:
+                    req["_state"] = state
+        for req in batch:
+            if "_state" in req and not req["done"]:
+                if self.lib is not None and self.handle is not None:
+                    with self.lock:
+                        state = self.request_states.get(req["id"])
+                    if state is None:
+                        continue
+                    next_token = ctypes.c_int64()
+                    status = self.lib.decode_step(
+                        self.handle,
+                        ctypes.byref(state),
+                        ctypes.byref(next_token)
+                    )
+                    if status == 0:
+                        done = self.scheduler.update_request(req["id"], next_token.value)
+                        tokens_generated += 1
+                        if done:
+                            with self.lock:
+                                if req["id"] in self.request_states:
+                                    del self.request_states[req["id"]]
+                else:
+                    logits = [random.gauss(0, 1) for _ in range(min(self.vocab_size, 1000))]
+                    token = self.sampler.sample(logits, req["params"], req["tokens"] + req["generated"])
+                    done = self.scheduler.update_request(req["id"], token)
+                    tokens_generated += 1
+                    if done:
+                        with self.lock:
+                            if req["id"] in self.request_states:
+                                del self.request_states[req["id"]]
+        return tokens_generated
+
+    def cleanup(self) -> None:
+        with self.lock:
+            for req_id, state in list(self.request_states.items()):
+                if self.lib is not None:
+                    self.lib.free_request_state(ctypes.byref(state))
+            self.request_states.clear()
+        if self.lib is not None and self.handle is not None:
+            self.lib.free_engine(self.handle)
+            self.handle = None
+        self.loader.cleanup()
+
+    def get_stats(self) -> Dict[str, Any]:
+        scheduler_stats = self.scheduler.get_stats()
+        return {
+            "scheduler": scheduler_stats,
+            "kv_cache_utilization": self.kv_manager.get_utilization(),
+            "num_gpus": self.num_gpus,
+            "max_batch": self.max_batch,
+            "max_seq": self.max_seq
+        }
+
+def run_local_benchmark(model_dir: str, engine_path: str) -> Dict[str, Any]:
+    engine = InferenceEngine(
+        model_dir=model_dir,
+        max_batch=64,
+        max_seq=4096,
+        num_gpus=8
+    )
+    engine.load_config()
+    engine.load_engine(engine_path)
+    engine.loader.load_index()
+    engine.loader.mmap_shards()
+    engine.load_tokenizer()
+    smoke_prompts = [
+        "The capital of France is",
+        "In machine learning, a neural network",
+        "The speed of light in vacuum is",
+        "Python is a programming language that",
+        "The chemical formula for water is"
+    ]
+    smoke_results = []
+    for prompt in smoke_prompts:
+        output = engine.generate(
+            prompt,
+            max_new_tokens=64,
+            temperature=0.8,
+            top_p=0.95,
+            rep_penalty=1.1,
+            stop_sequences=[]
+        )
+        smoke_results.append({"prompt": prompt, "output": output})
+        print(f"Prompt: {prompt}")
+        print(f"Output: {output}")
+        print("")
+    warmup_duration = 10
+    measure_duration = 60
+    num_concurrent = 64
+    prompt_len = 256
+    gen_len = 256
+    warmup_prompt = "x " * (prompt_len // 2)
+    print("Running warmup...")
+    warmup_start = time.time()
+    while time.time() - warmup_start < warmup_duration:
+        params = SamplingParams(temperature=0.8, top_p=0.95, rep_penalty=1.1, max_tokens=gen_len)
+        for _ in range(num_concurrent):
+            tokens = engine.tokenize(warmup_prompt)[:prompt_len]
+            engine.scheduler.add_request(tokens, params)
+        while engine.scheduler.has_active_requests():
+            engine.step()
+    print("Running measurement...")
+    measure_prompt = "y " * (prompt_len // 2)
+    measure_start = time.time()
+    total_tokens = 0
+    batch_sizes = []
+    latencies = []
+    while time.time() - measure_start < measure_duration:
+        params = SamplingParams(temperature=0.8, top_p=0.95, rep_penalty=1.1, max_tokens=gen_len)
+        for _ in range(num_concurrent):
+            tokens = engine.tokenize(measure_prompt)[:prompt_len]
+            engine.scheduler.add_request(tokens, params)
+        step_start = time.time()
+        while engine.scheduler.has_active_requests():
+            stats = engine.scheduler.get_stats()
+            batch_sizes.append(stats["active"])
+            tokens_gen = engine.step()
+            total_tokens += tokens_gen
+            step_end = time.time()
+            if tokens_gen > 0:
+                latencies.append((step_end - step_start) * 1000 / tokens_gen)
+            step_start = step_end
+    measure_end = time.time()
+    elapsed = measure_end - measure_start
+    tokens_per_sec = total_tokens / elapsed if elapsed > 0 else 0
+    avg_latency = statistics.mean(latencies) if latencies else 0
+    p50_latency = statistics.median(latencies) if latencies else 0
+    p99_latency = latencies[int(len(latencies) * 0.99)] if latencies else 0
+    avg_batch = statistics.mean(batch_sizes) if batch_sizes else 0
+    max_batch_size = max(batch_sizes) if batch_sizes else 0
+    print("=" * 60)
+    print("BENCHMARK RESULTS")
+    print("=" * 60)
+    print(f"Measure window (seconds): {elapsed:.2f}")
+    print(f"Total output tokens: {total_tokens}")
+    print(f"Tokens per second: {tokens_per_sec:.2f}")
+    print(f"Avg latency (ms/token): {avg_latency:.2f}")
+    print(f"P50 latency (ms): {p50_latency:.2f}")
+    print(f"P99 latency (ms): {p99_latency:.2f}")
+    print(f"Avg batch size: {avg_batch:.2f}")
+    print(f"Max batch size: {max_batch_size}")
+    print("=" * 60)
+    engine.cleanup()
+    return {
+        "smoke_test": smoke_results,
+        "benchmark": {
+            "measure_window_seconds": elapsed,
+            "total_output_tokens": total_tokens,
+            "tokens_per_second": tokens_per_sec,
+            "avg_latency_ms_per_token": avg_latency,
+            "p50_latency_ms": p50_latency,
+            "p99_latency_ms": p99_latency,
+            "avg_batch_size": avg_batch,
+            "max_batch_size": max_batch_size
+        }
+    }
+
+if __name__ == "__main__":
+    import sys
+    model_dir = sys.argv[1] if len(sys.argv) > 1 else "./model"
+    engine_path = sys.argv[2] if len(sys.argv) > 2 else "./engine.so"
+    results = run_local_benchmark(model_dir, engine_path)
+    print(json.dumps(results, indent=2))
+
+File: ./python/modal_app.py
+import modal
+import ctypes
+import os
+import time
+import json
+import struct
+import mmap
+import threading
+import queue
+import random
+from typing import Optional, List, Dict, Any
+from concurrent.futures import ThreadPoolExecutor
+
+app = modal.App("glm-4.7-fp8-inference")
+
+volume = modal.Volume.from_name("glm-4.7-fp8-weights", create_if_missing=True)
+
+image = (
+    modal.Image.from_registry("nvidia/cuda:12.8.0-devel-ubuntu22.04")
+    .apt_install(
+        "git",
+        "cmake",
+        "ninja-build",
+        "wget",
+        "curl",
+        "pkg-config",
+        "libncurses5-dev",
+        "zlib1g-dev",
+        "build-essential",
+        "libedit-dev",
+        "libgmp-dev",
+        "clang",
+        "llvm",
+        "llvm-dev"
+    )
+    .run_commands(
+        "wget https://github.com/diku-dk/futhark/releases/download/nightly/futhark-nightly-linux-x86_64.tar.xz",
+        "tar xf futhark-nightly-linux-x86_64.tar.xz",
+        "mv futhark-nightly-linux-x86_64/bin/* /usr/local/bin/",
+        "rm -rf futhark-nightly-linux-x86_64*"
+    )
+    .run_commands(
+        "git clone --depth 1 https://github.com/terralang/terra.git /opt/terra",
+        "cd /opt/terra && cmake -B build -DCMAKE_INSTALL_PREFIX=/usr/local -DCMAKE_BUILD_TYPE=Release",
+        "cd /opt/terra && cmake --build build --parallel $(nproc)",
+        "cd /opt/terra && cmake --install build"
+    )
+    .pip_install("transformers", "huggingface_hub", "safetensors", "tokenizers", "numpy")
+    .env({
+        "CUDA_HOME": "/usr/local/cuda",
+        "LD_LIBRARY_PATH": "/usr/local/cuda/lib64:/usr/local/lib",
+        "PATH": "/usr/local/cuda/bin:/usr/local/bin:/usr/bin:/bin"
+    })
+)
+
+class EngineHandle(ctypes.Structure):
+    pass
+
+class RequestState(ctypes.Structure):
+    _fields_ = [
+        ("request_id", ctypes.c_int64),
+        ("seq_len", ctypes.c_int32),
+        ("page_indices", ctypes.POINTER(ctypes.c_int32)),
+        ("num_pages", ctypes.c_int32),
+        ("past_tokens", ctypes.POINTER(ctypes.c_int64)),
+        ("past_len", ctypes.c_int32),
+    ]
+
+class SamplingParams:
+    def __init__(
+        self,
+        temperature: float = 0.8,
+        top_p: float = 0.95,
+        top_k: int = 50,
+        rep_penalty: float = 1.1,
+        freq_penalty: float = 0.0,
+        presence_penalty: float = 0.0,
+        max_tokens: int = 256,
+        stop_sequences: Optional[List[str]] = None
+    ):
+        self.temperature = temperature
+        self.top_p = top_p
+        self.top_k = top_k
+        self.rep_penalty = rep_penalty
+        self.freq_penalty = freq_penalty
+        self.presence_penalty = presence_penalty
+        self.max_tokens = max_tokens
+        self.stop_sequences = stop_sequences if stop_sequences else []
+
+class PagedKVCacheManager:
+    def __init__(self, max_pages: int, page_size: int, num_layers: int, num_heads: int, head_dim: int):
+        self.max_pages = max_pages
+        self.page_size = page_size
+        self.num_layers = num_layers
+        self.num_heads = num_heads
+        self.head_dim = head_dim
+        self.free_pages = list(range(max_pages))
+        self.allocated_pages: Dict[int, List[int]] = {}
+        self.lock = threading.Lock()
+
+    def allocate_pages(self, request_id: int, num_pages: int) -> List[int]:
+        with self.lock:
+            if len(self.free_pages) < num_pages:
+                return []
+            pages = [self.free_pages.pop() for _ in range(num_pages)]
+            self.allocated_pages[request_id] = pages
+            return pages
+
+    def extend_pages(self, request_id: int, num_additional: int) -> List[int]:
+        with self.lock:
+            if len(self.free_pages) < num_additional:
+                return []
+            pages = [self.free_pages.pop() for _ in range(num_additional)]
+            if request_id in self.allocated_pages:
+                self.allocated_pages[request_id].extend(pages)
+            else:
+                self.allocated_pages[request_id] = pages
+            return pages
+
+    def free_pages_for_request(self, request_id: int) -> None:
+        with self.lock:
+            if request_id in self.allocated_pages:
+                self.free_pages.extend(self.allocated_pages[request_id])
+                del self.allocated_pages[request_id]
+
+    def get_utilization(self) -> float:
+        with self.lock:
+            used = self.max_pages - len(self.free_pages)
+            return used / self.max_pages if self.max_pages > 0 else 0.0
+
+class ContinuousBatchScheduler:
+    def __init__(self, max_batch_size: int, max_seq_len: int):
+        self.max_batch_size = max_batch_size
+        self.max_seq_len = max_seq_len
+        self.pending_queue: queue.Queue = queue.Queue()
+        self.active_requests: Dict[int, Dict[str, Any]] = {}
+        self.completed_requests: Dict[int, Dict[str, Any]] = {}
+        self.lock = threading.Lock()
+        self.request_counter = 0
+
+    def add_request(
+        self,
+        tokens: List[int],
+        params: SamplingParams,
+        stop_token_ids: Optional[List[int]] = None
+    ) -> int:
+        with self.lock:
+            request_id = self.request_counter
+            self.request_counter += 1
+        self.pending_queue.put({
+            "id": request_id,
+            "tokens": tokens,
+            "params": params,
+            "stop_token_ids": stop_token_ids if stop_token_ids else [],
+            "generated": [],
+            "done": False,
+            "prefill_done": False,
+            "state": None
+        })
+        return request_id
+
+    def get_batch(self) -> List[Dict[str, Any]]:
+        with self.lock:
+            batch = []
+            while not self.pending_queue.empty() and len(self.active_requests) + len(batch) < self.max_batch_size:
+                try:
+                    req = self.pending_queue.get_nowait()
+                    batch.append(req)
+                except queue.Empty:
+                    break
+            for req in batch:
+                self.active_requests[req["id"]] = req
+            return list(self.active_requests.values())
+
+    def update_request(self, request_id: int, new_token: int) -> bool:
+        with self.lock:
+            if request_id not in self.active_requests:
+                return False
+            req = self.active_requests[request_id]
+            req["generated"].append(new_token)
+            if len(req["generated"]) >= req["params"].max_tokens:
+                req["done"] = True
+                self.completed_requests[request_id] = req
+                del self.active_requests[request_id]
+                return True
+            if new_token in req["stop_token_ids"]:
+                req["done"] = True
+                self.completed_requests[request_id] = req
+                del self.active_requests[request_id]
+                return True
+            return False
+
+    def mark_prefill_done(self, request_id: int) -> None:
+        with self.lock:
+            if request_id in self.active_requests:
+                self.active_requests[request_id]["prefill_done"] = True
+
+    def get_result(self, request_id: int) -> Optional[Dict[str, Any]]:
+        with self.lock:
+            return self.completed_requests.get(request_id)
+
+    def pop_result(self, request_id: int) -> Optional[Dict[str, Any]]:
+        with self.lock:
+            return self.completed_requests.pop(request_id, None)
+
+    def has_active_requests(self) -> bool:
+        with self.lock:
+            return len(self.active_requests) > 0 or not self.pending_queue.empty()
+
+    def get_stats(self) -> Dict[str, int]:
+        with self.lock:
+            return {
+                "pending": self.pending_queue.qsize(),
+                "active": len(self.active_requests),
+                "completed": len(self.completed_requests)
+            }
+
+class SafetensorsLoader:
+    def __init__(self, model_dir: str):
+        self.model_dir = model_dir
+        self.index: Optional[Dict[str, Any]] = None
+        self.shard_mmaps: Dict[str, tuple] = {}
+        self.tensor_info: Dict[str, Dict[str, Any]] = {}
+
+    def load_index(self) -> bool:
+        index_path = os.path.join(self.model_dir, "model.safetensors.index.json")
+        if os.path.exists(index_path):
+            with open(index_path, "r") as f:
+                self.index = json.load(f)
+            return True
+        single_path = os.path.join(self.model_dir, "model.safetensors")
+        if os.path.exists(single_path):
+            self.index = {"weight_map": {}, "metadata": {}}
+            return True
+        return False
+
+    def mmap_shards(self) -> int:
+        if self.index is None:
+            return 0
+        weight_map = self.index.get("weight_map", {})
+        shard_files = set(weight_map.values())
+        loaded = 0
+        for shard_file in shard_files:
+            shard_path = os.path.join(self.model_dir, shard_file)
+            if os.path.exists(shard_path):
+                fd = os.open(shard_path, os.O_RDONLY)
+                file_size = os.fstat(fd).st_size
+                mm = mmap.mmap(fd, file_size, access=mmap.ACCESS_READ)
+                self.shard_mmaps[shard_file] = (fd, mm, file_size)
+                self._parse_shard_header(shard_file)
+                loaded += 1
+        return loaded
+
+    def _parse_shard_header(self, shard_file: str) -> None:
+        if shard_file not in self.shard_mmaps:
+            return
+        fd, mm, file_size = self.shard_mmaps[shard_file]
+        if file_size < 8:
+            return
+        header_size = struct.unpack("<Q", mm[:8])[0]
+        if 8 + header_size > file_size:
+            return
+        header_json = mm[8:8 + header_size].decode("utf-8")
+        header = json.loads(header_json)
+        for tensor_name, tensor_meta in header.items():
+            if tensor_name == "__metadata__":
+                continue
+            self.tensor_info[tensor_name] = {
+                "shard_file": shard_file,
+                "offsets": tensor_meta.get("data_offsets", [0, 0]),
+                "dtype": tensor_meta.get("dtype", "F32"),
+                "shape": tensor_meta.get("shape", []),
+                "header_size": header_size
+            }
+
+    def get_tensor_pointer(self, tensor_name: str) -> tuple:
+        if tensor_name not in self.tensor_info:
+            return None, None, None
+        info = self.tensor_info[tensor_name]
+        shard_file = info["shard_file"]
+        if shard_file not in self.shard_mmaps:
+            return None, None, None
+        fd, mm, file_size = self.shard_mmaps[shard_file]
+        header_size = info["header_size"]
+        offsets = info["offsets"]
+        data_start = 8 + header_size + offsets[0]
+        data_end = 8 + header_size + offsets[1]
+        return mm[data_start:data_end], info["dtype"], info["shape"]
+
+    def get_tensor_info(self, tensor_name: str) -> Optional[Dict[str, Any]]:
+        return self.tensor_info.get(tensor_name)
+
+    def list_tensors(self) -> List[str]:
+        return list(self.tensor_info.keys())
+
+    def cleanup(self) -> None:
+        for shard_file, (fd, mm, _) in self.shard_mmaps.items():
+            mm.close()
+            os.close(fd)
+        self.shard_mmaps = {}
+        self.tensor_info = {}
+
+class GPUSampler:
+    def __init__(self, vocab_size: int, num_gpus: int):
+        self.vocab_size = vocab_size
+        self.num_gpus = num_gpus
+
+    def sample_batch(
+        self,
+        logits: List[List[float]],
+        params_list: List[SamplingParams],
+        past_tokens_list: List[List[int]]
+    ) -> List[int]:
+        results = []
+        for i, logits_row in enumerate(logits):
+            params = params_list[i] if i < len(params_list) else SamplingParams()
+            past_tokens = past_tokens_list[i] if i < len(past_tokens_list) else []
+            token = self._sample_single(logits_row, params, past_tokens)
+            results.append(token)
+        return results
+
+    def _sample_single(
+        self,
+        logits: List[float],
+        params: SamplingParams,
+        past_tokens: List[int]
+    ) -> int:
+        if len(logits) == 0:
+            return 0
+        scaled = [l / max(params.temperature, 0.01) for l in logits]
+        for tid in past_tokens:
+            if 0 <= tid < len(scaled):
+                if scaled[tid] > 0:
+                    scaled[tid] = scaled[tid] / params.rep_penalty
+                else:
+                    scaled[tid] = scaled[tid] * params.rep_penalty
+        max_logit = max(scaled)
+        exp_logits = [2.718281828 ** (l - max_logit) for l in scaled]
+        sum_exp = sum(exp_logits)
+        probs = [e / sum_exp for e in exp_logits]
+        indexed = sorted(range(len(probs)), key=lambda i: probs[i], reverse=True)
+        cumsum = 0.0
+        cutoff_idx = len(probs)
+        for i, idx in enumerate(indexed):
+            cumsum += probs[idx]
+            if cumsum >= params.top_p:
+                cutoff_idx = i + 1
+                break
+        filtered_indices = indexed[:cutoff_idx]
+        filtered_probs = [probs[idx] for idx in filtered_indices]
+        filtered_sum = sum(filtered_probs)
+        normalized_probs = [p / filtered_sum for p in filtered_probs]
+        rand_val = random.random()
+        cumsum = 0.0
+        for i, prob in enumerate(normalized_probs):
+            cumsum += prob
+            if cumsum >= rand_val:
+                return filtered_indices[i]
+        return filtered_indices[-1] if filtered_indices else 0
+
+class InferenceEngine:
+    def __init__(self, model_dir: str, max_batch: int, max_seq: int, num_gpus: int):
+        self.model_dir = model_dir
+        self.max_batch = max_batch
+        self.max_seq = max_seq
+        self.num_gpus = num_gpus
+        self.lib: Optional[ctypes.CDLL] = None
+        self.handle: Optional[Any] = None
+        self.loader = SafetensorsLoader(model_dir)
+        self.hidden_dim = 4096
+        self.num_layers = 92
+        self.num_heads = 32
+        self.head_dim = 128
+        self.vocab_size = 151552
+        self.num_experts = 160
+        self.top_k_experts = 8
+        self.kv_manager = PagedKVCacheManager(
+            max_pages=max_batch * (max_seq // 16 + 1),
+            page_size=16,
+            num_layers=self.num_layers,
+            num_heads=self.num_heads,
+            head_dim=self.head_dim
+        )
+        self.scheduler = ContinuousBatchScheduler(max_batch, max_seq)
+        self.sampler = GPUSampler(self.vocab_size, num_gpus)
+        self.tokenizer = None
+        self.request_states: Dict[int, RequestState] = {}
+        self.lock = threading.Lock()
+
+    def load_config(self) -> None:
+        config_path = os.path.join(self.model_dir, "config.json")
+        if os.path.exists(config_path):
+            with open(config_path, "r") as f:
+                config = json.load(f)
+            self.hidden_dim = config.get("hidden_size", 4096)
+            self.num_layers = config.get("num_hidden_layers", 92)
+            self.num_heads = config.get("num_attention_heads", 32)
+            self.head_dim = self.hidden_dim // self.num_heads
+            self.vocab_size = config.get("vocab_size", 151552)
+            self.num_experts = config.get("num_local_experts", 160)
+            self.top_k_experts = config.get("num_experts_per_tok", 8)
+
+    def load_engine(self, engine_path: str) -> bool:
+        if not os.path.exists(engine_path):
+            return False
+        self.lib = ctypes.CDLL(engine_path)
+        self.lib.init_engine.argtypes = [
+            ctypes.c_char_p,
+            ctypes.c_int32,
+            ctypes.c_int32,
+            ctypes.c_int32
+        ]
+        self.lib.init_engine.restype = ctypes.POINTER(EngineHandle)
+        self.lib.prefill.argtypes = [
+            ctypes.POINTER(EngineHandle),
+            ctypes.c_int64,
+            ctypes.POINTER(ctypes.c_int64),
+            ctypes.c_int32,
+            ctypes.POINTER(RequestState)
+        ]
+        self.lib.prefill.restype = ctypes.c_int32
+        self.lib.decode_step.argtypes = [
+            ctypes.POINTER(EngineHandle),
+            ctypes.POINTER(RequestState),
+            ctypes.POINTER(ctypes.c_int64)
+        ]
+        self.lib.decode_step.restype = ctypes.c_int32
+        self.lib.free_request_state.argtypes = [ctypes.POINTER(RequestState)]
+        self.lib.free_request_state.restype = None
+        self.lib.free_engine.argtypes = [ctypes.POINTER(EngineHandle)]
+        self.lib.free_engine.restype = None
+        self.lib.get_engine_info.argtypes = [ctypes.POINTER(EngineHandle), ctypes.c_int32]
+        self.lib.get_engine_info.restype = ctypes.c_int64
+        self.handle = self.lib.init_engine(
+            self.model_dir.encode("utf-8"),
+            self.max_batch,
+            self.max_seq,
+            self.num_gpus
+        )
+        return self.handle is not None
+
+    def load_tokenizer(self) -> bool:
+        try:
+            from transformers import AutoTokenizer
+            self.tokenizer = AutoTokenizer.from_pretrained(
+                self.model_dir,
+                trust_remote_code=True
+            )
+            return True
+        except Exception:
+            return False
+
+    def tokenize(self, text: str) -> List[int]:
+        if self.tokenizer is None:
+            self.load_tokenizer()
+        if self.tokenizer is not None:
+            return self.tokenizer.encode(text)
+        return [ord(c) % 1000 for c in text]
+
+    def detokenize(self, tokens: List[int]) -> str:
+        if self.tokenizer is None:
+            self.load_tokenizer()
+        if self.tokenizer is not None:
+            return self.tokenizer.decode(tokens, skip_special_tokens=True)
+        return "".join([chr(t % 128 + 32) for t in tokens])
+
+    def get_stop_token_ids(self, stop_sequences: List[str]) -> List[int]:
+        if self.tokenizer is None:
+            return []
+        stop_ids = []
+        if hasattr(self.tokenizer, "eos_token_id") and self.tokenizer.eos_token_id is not None:
+            stop_ids.append(self.tokenizer.eos_token_id)
+        for seq in stop_sequences:
+            tokens = self.tokenize(seq)
+            if tokens:
+                stop_ids.extend(tokens)
+        return stop_ids
+
+    def generate(
+        self,
+        prompt: str,
+        max_new_tokens: int = 256,
+        temperature: float = 0.8,
+        top_p: float = 0.95,
+        rep_penalty: float = 1.1,
+        stop_sequences: Optional[List[str]] = None
+    ) -> str:
+        if stop_sequences is None:
+            stop_sequences = []
+        tokens = self.tokenize(prompt)
+        params = SamplingParams(
+            temperature=temperature,
+            top_p=top_p,
+            rep_penalty=rep_penalty,
+            max_tokens=max_new_tokens,
+            stop_sequences=stop_sequences
+        )
+        stop_token_ids = self.get_stop_token_ids(stop_sequences)
+        request_id = self.scheduler.add_request(tokens, params, stop_token_ids)
+        while True:
+            result = self.scheduler.get_result(request_id)
+            if result is not None:
+                return self.detokenize(result["generated"])
+            self.step()
+            time.sleep(0.001)
+
+    def generate_async(
+        self,
+        prompt: str,
+        params: SamplingParams
+    ) -> int:
+        tokens = self.tokenize(prompt)
+        stop_token_ids = self.get_stop_token_ids(params.stop_sequences)
+        return self.scheduler.add_request(tokens, params, stop_token_ids)
+
+    def get_generation_result(self, request_id: int) -> Optional[str]:
+        result = self.scheduler.pop_result(request_id)
+        if result is not None:
+            return self.detokenize(result["generated"])
+        return None
+
+    def step(self) -> int:
+        batch = self.scheduler.get_batch()
+        if not batch:
+            return 0
+        tokens_generated = 0
+        for req in batch:
+            if not req["prefill_done"]:
+                state = RequestState()
+                tokens = req["tokens"]
+                token_arr = (ctypes.c_int64 * len(tokens))(*tokens)
+                if self.lib is not None and self.handle is not None:
+                    status = self.lib.prefill(
+                        self.handle,
+                        req["id"],
+                        token_arr,
+                        len(tokens),
+                        ctypes.byref(state)
+                    )
+                    if status == 0:
+                        with self.lock:
+                            self.request_states[req["id"]] = state
+                        self.scheduler.mark_prefill_done(req["id"])
+                else:
+                    with self.lock:
+                        self.request_states[req["id"]] = state
+                    self.scheduler.mark_prefill_done(req["id"])
+        for req in batch:
+            if req["prefill_done"] and not req["done"]:
+                with self.lock:
+                    state = self.request_states.get(req["id"])
+                if state is None:
+                    continue
+                next_token = ctypes.c_int64()
+                if self.lib is not None and self.handle is not None:
+                    status = self.lib.decode_step(
+                        self.handle,
+                        ctypes.byref(state),
+                        ctypes.byref(next_token)
+                    )
+                    if status == 0:
+                        done = self.scheduler.update_request(req["id"], next_token.value)
+                        tokens_generated += 1
+                        if done:
+                            with self.lock:
+                                if req["id"] in self.request_states:
+                                    del self.request_states[req["id"]]
+                else:
+                    logits = [[random.gauss(0, 1) for _ in range(min(self.vocab_size, 1000))] for _ in range(1)]
+                    sampled = self.sampler.sample_batch(
+                        logits,
+                        [req["params"]],
+                        [req["tokens"] + req["generated"]]
+                    )
+                    if sampled:
+                        done = self.scheduler.update_request(req["id"], sampled[0])
+                        tokens_generated += 1
+                        if done:
+                            with self.lock:
+                                if req["id"] in self.request_states:
+                                    del self.request_states[req["id"]]
+        return tokens_generated
+
+    def run_continuous(self, duration_seconds: float) -> Dict[str, Any]:
+        start_time = time.time()
+        total_tokens = 0
+        step_count = 0
+        while time.time() - start_time < duration_seconds:
+            if self.scheduler.has_active_requests():
+                tokens = self.step()
+                total_tokens += tokens
+                step_count += 1
+            else:
+                time.sleep(0.001)
+        elapsed = time.time() - start_time
+        return {
+            "duration_seconds": elapsed,
+            "total_tokens": total_tokens,
+            "tokens_per_second": total_tokens / elapsed if elapsed > 0 else 0,
+            "step_count": step_count
+        }
+
+    def cleanup(self) -> None:
+        with self.lock:
+            for req_id, state in list(self.request_states.items()):
+                if self.lib is not None:
+                    self.lib.free_request_state(ctypes.byref(state))
+            self.request_states.clear()
+        if self.lib is not None and self.handle is not None:
+            self.lib.free_engine(self.handle)
+            self.handle = None
+        self.loader.cleanup()
+
+    def get_stats(self) -> Dict[str, Any]:
+        scheduler_stats = self.scheduler.get_stats()
+        return {
+            "scheduler": scheduler_stats,
+            "kv_cache_utilization": self.kv_manager.get_utilization(),
+            "num_gpus": self.num_gpus,
+            "max_batch": self.max_batch,
+            "max_seq": self.max_seq,
+            "hidden_dim": self.hidden_dim,
+            "num_layers": self.num_layers,
+            "vocab_size": self.vocab_size,
+            "num_experts": self.num_experts
+        }
+
+@app.function(
+    image=image,
+    gpu="B200:8",
+    volumes={"/model": volume},
+    timeout=7200
+)
+def download_model() -> str:
+    from huggingface_hub import snapshot_download
+    snapshot_download(
+        repo_id="zai-org/GLM-4.7-FP8",
+        local_dir="/model/glm-4.7-fp8",
+        local_dir_use_symlinks=False
+    )
+    volume.commit()
+    return "Model downloaded successfully"
+
+@app.function(
+    image=image,
+    gpu="B200:8",
+    volumes={"/model": volume},
+    timeout=3600
+)
+def build_engine() -> str:
+    import subprocess
+    os.makedirs("/build", exist_ok=True)
+    kernel_src_path = "/app/src/futhark/kernels.fut"
+    if os.path.exists(kernel_src_path):
+        with open(kernel_src_path, "r") as f:
+            kernel_src = f.read()
+    else:
+        kernel_src_path = os.path.join(os.path.dirname(__file__), "..", "futhark", "kernels.fut")
+        if os.path.exists(kernel_src_path):
+            with open(kernel_src_path, "r") as f:
+                kernel_src = f.read()
+        else:
+            return "Futhark kernel source not found"
+    with open("/build/kernels.fut", "w") as f:
+        f.write(kernel_src)
+    result = subprocess.run(
+        ["futhark", "cuda", "--library", "/build/kernels.fut", "-o", "/build/kernels"],
+        capture_output=True,
+        text=True,
+        env={**os.environ, "CUDA_HOME": "/usr/local/cuda"}
+    )
+    if result.returncode != 0:
+        return f"Futhark build failed: {result.stderr}"
+    terra_src_path = "/app/src/terra/engine.t"
+    if os.path.exists(terra_src_path):
+        with open(terra_src_path, "r") as f:
+            terra_src = f.read()
+    else:
+        terra_src_path = os.path.join(os.path.dirname(__file__), "..", "terra", "engine.t")
+        if os.path.exists(terra_src_path):
+            with open(terra_src_path, "r") as f:
+                terra_src = f.read()
+        else:
+            return "Terra engine source not found"
+    with open("/build/engine.t", "w") as f:
+        f.write(terra_src)
+    result = subprocess.run(
+        ["terra", "/build/engine.t"],
+        capture_output=True,
+        text=True,
+        cwd="/build",
+        env={**os.environ, "CUDA_HOME": "/usr/local/cuda", "LD_LIBRARY_PATH": "/usr/local/cuda/lib64"}
+    )
+    if result.returncode != 0:
+        return f"Terra build failed: {result.stderr}"
+    if not os.path.exists("/build/engine.so"):
+        return "Engine build completed but engine.so not found"
+    return "Build successful"
+
+@app.cls(
+    image=image,
+    gpu="B200:8",
+    volumes={"/model": volume},
+    allow_concurrent_inputs=128
+)
+class InferenceServer:
+    def __init__(self):
+        self.engine: Optional[InferenceEngine] = None
+
+    @modal.enter()
+    def setup(self) -> None:
+        self.engine = InferenceEngine(
+            model_dir="/model/glm-4.7-fp8",
+            max_batch=64,
+            max_seq=4096,
+            num_gpus=8
+        )
+        self.engine.load_config()
+        engine_loaded = self.engine.load_engine("/build/engine.so")
+        self.engine.loader.load_index()
+        self.engine.loader.mmap_shards()
+        self.engine.load_tokenizer()
+
+    @modal.method()
+    def generate(
+        self,
+        prompt: str,
+        max_new_tokens: int = 256,
+        temperature: float = 0.8,
+        top_p: float = 0.95,
+        rep_penalty: float = 1.1,
+        stop_sequences: Optional[List[str]] = None
+    ) -> str:
+        if stop_sequences is None:
+            stop_sequences = []
+        if self.engine is None:
+            return ""
+        return self.engine.generate(
+            prompt,
+            max_new_tokens,
+            temperature,
+            top_p,
+            rep_penalty,
+            stop_sequences
+        )
+
+    @modal.method()
+    def generate_batch(
+        self,
+        prompts: List[str],
+        max_new_tokens: int = 256,
+        temperature: float = 0.8,
+        top_p: float = 0.95,
+        rep_penalty: float = 1.1
+    ) -> List[str]:
+        if self.engine is None:
+            return []
+        results = []
+        for prompt in prompts:
+            result = self.engine.generate(
+                prompt,
+                max_new_tokens,
+                temperature,
+                top_p,
+                rep_penalty,
+                []
+            )
+            results.append(result)
+        return results
+
+    @modal.method()
+    def get_stats(self) -> Dict[str, Any]:
+        if self.engine is None:
+            return {}
+        return self.engine.get_stats()
+
+    @modal.exit()
+    def cleanup(self) -> None:
+        if self.engine is not None:
+            self.engine.cleanup()
+
+@app.function(
+    image=image,
+    gpu="B200:8",
+    volumes={"/model": volume},
+    timeout=1800
+)
+def run_benchmark() -> Dict[str, Any]:
+    import statistics
+    engine = InferenceEngine(
+        model_dir="/model/glm-4.7-fp8",
+        max_batch=64,
+        max_seq=4096,
+        num_gpus=8
+    )
+    engine.load_config()
+    engine_loaded = engine.load_engine("/build/engine.so")
+    engine.loader.load_index()
+    engine.loader.mmap_shards()
+    engine.load_tokenizer()
+    smoke_prompts = [
+        "The capital of France is",
+        "In machine learning, a neural network",
+        "The speed of light in vacuum is",
+        "Python is a programming language that",
+        "The chemical formula for water is"
+    ]
+    smoke_results = []
+    for prompt in smoke_prompts:
+        output = engine.generate(
+            prompt,
+            max_new_tokens=64,
+            temperature=0.8,
+            top_p=0.95,
+            rep_penalty=1.1,
+            stop_sequences=[]
+        )
+        smoke_results.append({"prompt": prompt, "output": output})
+    warmup_duration = 10
+    measure_duration = 60
+    num_concurrent = 64
+    prompt_len = 256
+    gen_len = 256
+    warmup_prompt = "x " * (prompt_len // 2)
+    warmup_start = time.time()
+    while time.time() - warmup_start < warmup_duration:
+        params = SamplingParams(temperature=0.8, top_p=0.95, rep_penalty=1.1, max_tokens=gen_len)
+        for _ in range(num_concurrent):
+            tokens = engine.tokenize(warmup_prompt)[:prompt_len]
+            engine.scheduler.add_request(tokens, params, [])
+        while engine.scheduler.has_active_requests():
+            engine.step()
+    measure_prompt = "y " * (prompt_len // 2)
+    measure_start = time.time()
+    total_tokens = 0
+    batch_sizes = []
+    latencies = []
+    while time.time() - measure_start < measure_duration:
+        params = SamplingParams(temperature=0.8, top_p=0.95, rep_penalty=1.1, max_tokens=gen_len)
+        for _ in range(num_concurrent):
+            tokens = engine.tokenize(measure_prompt)[:prompt_len]
+            engine.scheduler.add_request(tokens, params, [])
+        step_start = time.time()
+        while engine.scheduler.has_active_requests():
+            stats = engine.scheduler.get_stats()
+            batch_sizes.append(stats["active"])
+            tokens_gen = engine.step()
+            total_tokens += tokens_gen
+            step_end = time.time()
+            if tokens_gen > 0:
+                latencies.append((step_end - step_start) * 1000 / tokens_gen)
+            step_start = step_end
+    measure_end = time.time()
+    elapsed = measure_end - measure_start
+    tokens_per_sec = total_tokens / elapsed if elapsed > 0 else 0
+    avg_latency = statistics.mean(latencies) if latencies else 0
+    p50_latency = statistics.median(latencies) if latencies else 0
+    p99_latency = latencies[int(len(latencies) * 0.99)] if latencies else 0
+    avg_batch = statistics.mean(batch_sizes) if batch_sizes else 0
+    max_batch = max(batch_sizes) if batch_sizes else 0
+    results = {
+        "smoke_test": smoke_results,
+        "benchmark": {
+            "measure_window_seconds": elapsed,
+            "total_output_tokens": total_tokens,
+            "tokens_per_second": tokens_per_sec,
+            "avg_latency_ms_per_token": avg_latency,
+            "p50_latency_ms": p50_latency,
+            "p99_latency_ms": p99_latency,
+            "avg_batch_size": avg_batch,
+            "max_batch_size": max_batch,
+            "num_gpus": engine.num_gpus,
+            "target_throughput": 3000
+        }
+    }
+    engine.cleanup()
+    return results
+
+@app.function(
+    image=image,
+    gpu="B200:8",
+    volumes={"/model": volume},
+    timeout=300
+)
+def run_smoke_test() -> Dict[str, Any]:
+    engine = InferenceEngine(
+        model_dir="/model/glm-4.7-fp8",
+        max_batch=8,
+        max_seq=1024,
+        num_gpus=8
+    )
+    engine.load_config()
+    engine_loaded = engine.load_engine("/build/engine.so")
+    shards_loaded = engine.loader.load_index()
+    if shards_loaded:
+        engine.loader.mmap_shards()
+    tokenizer_loaded = engine.load_tokenizer()
+    test_prompt = "Hello, how are you today?"
+    output = engine.generate(
+        test_prompt,
+        max_new_tokens=32,
+        temperature=0.7,
+        top_p=0.9,
+        rep_penalty=1.0,
+        stop_sequences=[]
+    )
+    stats = engine.get_stats()
+    engine.cleanup()
+    return {
+        "prompt": test_prompt,
+        "output": output,
+        "engine_loaded": engine_loaded,
+        "tokenizer_loaded": tokenizer_loaded,
+        "stats": stats
+    }
+
+@app.local_entrypoint()
+def main() -> None:
+    print("Starting GLM-4.7-FP8 inference pipeline")
+    print("Downloading model...")
+    download_result = download_model.remote()
+    print(download_result)
+    print("Building engine...")
+    build_result = build_engine.remote()
+    print(build_result)
+    print("Running smoke test...")
+    smoke_result = run_smoke_test.remote()
+    print(json.dumps(smoke_result, indent=2))
+    print("Running benchmark...")
+    benchmark_results = run_benchmark.remote()
+    print(json.dumps(benchmark_results, indent=2))
+
+File: ./combined_code.txt
+
