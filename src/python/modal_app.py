@@ -687,14 +687,14 @@ def build_engine() -> str:
             f.write(content)
     nvcc_flags = "-O3 -shared -Xcompiler -fPIC -arch=sm_90"
     builds = [
-        (["nvcc"] + nvcc_flags.split() + ["-lcuda", "-o", "/build/libcudawrap.so", "/build/cuda_wrappers.cu"], "libcudawrap.so"),
-        (["nvcc"] + nvcc_flags.split() + ["-lnccl", "-o", "/build/libncclwrap.so", "/build/nccl_wrappers.cu"], "libncclwrap.so"),
-        (["nvcc"] + nvcc_flags.split() + ["-lcublas", "-lcublasLt", "-o", "/build/libcublaswrap.so", "/build/cublas_wrappers.cu"], "libcublaswrap.so"),
-        (["nvcc"] + nvcc_flags.split() + ["-o", "/build/libkernels.so", "/build/kernels.cu"], "libkernels.so"),
+        ("/build/cuda_wrappers.cu", ["nvcc"] + nvcc_flags.split() + ["-lcuda", "-o", "/build/libcudawrap.so", "/build/cuda_wrappers.cu"], "libcudawrap.so"),
+        ("/build/nccl_wrappers.cu", ["nvcc"] + nvcc_flags.split() + ["-lnccl", "-o", "/build/libncclwrap.so", "/build/nccl_wrappers.cu"], "libncclwrap.so"),
+        ("/build/cublas_wrappers.cu", ["nvcc"] + nvcc_flags.split() + ["-lcublas", "-lcublasLt", "-o", "/build/libcublaswrap.so", "/build/cublas_wrappers.cu"], "libcublaswrap.so"),
+        ("/build/kernels.cu", ["nvcc"] + nvcc_flags.split() + ["-o", "/build/libkernels.so", "/build/kernels.cu"], "libkernels.so"),
     ]
-    for cmd, target in builds:
-        if not os.path.exists(f"/build/{target.replace('lib', '').replace('.so', '')}_wrappers.cu") and "kernels" not in target:
-            continue
+    for src_file, cmd, target in builds:
+        if not os.path.exists(src_file):
+            return f"Source file {src_file} not found for {target}"
         result = subprocess.run(cmd, capture_output=True, text=True, env=env, cwd="/build")
         if result.returncode != 0:
             return f"NVCC build of {target} failed: {result.stderr}"

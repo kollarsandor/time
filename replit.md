@@ -41,6 +41,16 @@ High-performance inference engine for GLM-4.7-FP8 on 8x NVIDIA B200 GPUs via Mod
 - GPU sampler with temperature scaling, top-p filtering, repetition penalty
 - Tokenizer integration with HuggingFace transformers
 - Benchmark suite with warmup, measurement, latency statistics
+- 5-step deployment pipeline: download → build → validate → smoke test → benchmark
+
+### FastAPI Server (src/server/)
+
+- OpenAI-compatible API: /v1/completions and /v1/chat/completions
+- SSE streaming for token-by-token output
+- Continuous batching with async queue and backpressure handling
+- Health endpoints: /healthz, /readyz, /metrics (Prometheus format)
+- Structured JSON logging with request tracking (request_id, prompt_tokens, ttft_ms, tps)
+- Mock engine support for CPU-only testing and CI/CD
 
 ## Model Specifications
 
