@@ -1,9 +1,33 @@
 run = "nasm -f elf32 hello.asm && ld -m elf_i386 hello.o -o hello && ./hello"
 entrypoint = "hello.asm"
-modules = ["nix"]
+modules = ["nix", "python-3.11"]
 
 [nix]
 channel = "stable-24_05"
+packages = ["cargo", "libiconv", "openssl", "pkg-config", "rustc"]
 
 [agent]
 expertMode = true
+
+[workflows]
+runButton = "Project"
+
+[[workflows.workflow]]
+name = "Project"
+mode = "parallel"
+author = "agent"
+
+[[workflows.workflow.tasks]]
+task = "workflow.run"
+args = "GLM-4.7 Inference Test"
+
+[[workflows.workflow]]
+name = "GLM-4.7 Inference Test"
+author = "agent"
+
+[[workflows.workflow.tasks]]
+task = "shell.exec"
+args = "python3 run.py"
+
+[workflows.workflow.metadata]
+outputType = "console"
