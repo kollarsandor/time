@@ -125,3 +125,25 @@ void free_engine(EngineHandle* handle)
 - Batch size: up to 64 concurrent requests
 - Maximum sequence length: 4096 (configurable up to 131072)
 - Page size: 16 tokens for KV cache
+
+## Recent Changes (2026-01-02)
+
+- Fixed Terra for-loop bounds (0,N-1 exclusive iteration)
+- Added real CUDA wrappers (csrc/cuda_wrappers.cu/h) with actual cudaMalloc/memcpy
+- Added NCCL wrappers (csrc/nccl_wrappers.cu/h) for multi-GPU communication
+- Added cuBLAS wrappers (csrc/cublas_wrappers.cu/h) for GEMM operations
+- Added CUDA kernels (csrc/kernels.cu/h) for FP8 dequant, RMSNorm, RoPE, softmax, SwiGLU
+- Fixed softmax kernel (replaced incorrect atomicMax with shared memory reduction)
+- Fixed RMSNorm kernel (proper shared memory reduction)
+- Terra engine now loads real weights from safetensors to GPU
+- Real forward pass: embedding lookup -> lm_head -> logits
+- Supports both GPU mode (with CUDA) and CPU fallback mode
+- Build script creates CPU stubs when NVCC unavailable
+- Added smoke tests (tests/test_smoke.py) - all 5 pass
+
+## CUDA/C Source Files (csrc/)
+
+- cuda_wrappers.cu/h: CUDA memory, streams, events, synchronization
+- nccl_wrappers.cu/h: NCCL collective operations (AllReduce, AllGather, etc.)
+- cublas_wrappers.cu/h: cuBLAS/cuBLASLt GEMM operations
+- kernels.cu/h: FP8, RMSNorm, RoPE, softmax, SwiGLU, embedding, sampling
